@@ -1,0 +1,166 @@
+@import "tailwindcss";
+
+/* Class-based dark mode: `dark:` utilities apply when <html> (or any ancestor)
+ * has the `.dark` class, which the theme store toggles. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background-color: #f8fafc; /* slate-50 — matches the light app background */
+  color: #0f172a; /* slate-900 */
+}
+
+.dark body {
+  background-color: #020617; /* slate-950 */
+  color: #e2e8f0; /* slate-200 */
+}
+
+/* Smooth the flip of the big surfaces (not every element, to avoid jank). */
+.dark body,
+body {
+  transition: background-color 200ms ease, color 200ms ease;
+}
+
+/* ------------------------------------------------------------------ *
+ * Motion system — subtle, professional. Every animation is short and
+ * eases out; nothing bounces, rotates, or slides in from off-screen.
+ * All are disabled under prefers-reduced-motion (see bottom).
+ * ------------------------------------------------------------------ */
+
+/* Page/route transition — applied to each page root via .animate-page */
+@keyframes ar-page-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-page {
+  animation: ar-page-in 150ms ease-out;
+}
+
+/* Modal dialog: subtle scale + fade */
+@keyframes ar-modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.animate-modal {
+  animation: ar-modal-in 200ms ease-out;
+}
+
+/* Modal backdrop fade */
+@keyframes ar-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-backdrop {
+  animation: ar-fade-in 150ms ease-out;
+}
+
+/* Toast: slide in from the right + fade */
+@keyframes ar-toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(1rem);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-toast {
+  animation: ar-toast-in 300ms ease-out;
+}
+
+/* Stat number changed (e.g. via realtime) — brief scale pulse */
+@keyframes ar-stat-pulse {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.05);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.animate-stat-pulse {
+  animation: ar-stat-pulse 300ms ease-out;
+}
+
+/* Typing indicator dots — staggered opacity pulse */
+@keyframes ar-typing {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+.typing-dot {
+  animation: ar-typing 1.2s infinite ease-in-out;
+}
+
+/* Top loading bar — indeterminate sweep while queries are fetching */
+@keyframes ar-loading-bar {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(400%);
+  }
+}
+.animate-loading-bar {
+  animation: ar-loading-bar 1.1s infinite ease-in-out;
+}
+
+/* Status "configured" dot — gentle presence pulse (paired with Tailwind's
+   animate-ping on a sibling for the ring). */
+@keyframes ar-soft-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+.animate-soft-pulse {
+  animation: ar-soft-pulse 2s infinite ease-in-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-page,
+  .animate-modal,
+  .animate-backdrop,
+  .animate-toast,
+  .animate-stat-pulse,
+  .typing-dot,
+  .animate-loading-bar,
+  .animate-soft-pulse {
+    animation: none;
+  }
+}

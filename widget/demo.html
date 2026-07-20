@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Widget Demo — CSS isolation test</title>
+  <style>
+    /* Aggressive host-page styles — should NOT bleed into widget */
+    * { color: red !important; font-family: "Comic Sans MS", cursive !important; background: #fffde7 !important; }
+    body { margin: 0; padding: 40px; }
+    h1 { font-size: 2rem; }
+    p { max-width: 600px; line-height: 1.7; }
+  </style>
+</head>
+<body>
+  <h1>Widget CSS isolation test</h1>
+  <p>
+    Every element on this page has <code>color: red</code> and Comic Sans forced via
+    a global <code>* {}</code> rule with <code>!important</code>.<br>
+    The widget launcher, welcome screen, and chat window should look completely
+    normal — correct colors, correct font, no red text, no Comic Sans.
+  </p>
+  <p>
+    Serve this page from any static server (not <code>file://</code>, so the
+    browser's WebSocket/fetch origin checks pass) with the backend running
+    on <code>localhost:8000</code> (see <code>backend/CLAUDE.md</code>) — org
+    id below is Bright Smile Dental, a real seeded dev org with webchat enabled.
+  </p>
+
+  <script
+    src="/dist/cw.js"
+    data-org-id="688342de-38a1-40e7-9aba-92684d0142c6"
+    data-api-base="http://localhost:8000"
+  ></script>
+</body>
+</html>

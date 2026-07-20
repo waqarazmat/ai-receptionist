@@ -1,0 +1,45 @@
+# Secrets / credentials - NEVER commit
+.env
+.env.*
+!.env.example
+*.env
+google-service-account.json
+*-service-account.json
+*.pem
+*.key
+*.p12
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+ENV/
+
+# Node / frontend / widget
+node_modules/
+dist/
+build/
+.vite/
+*.local
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+
+# Claude Code - keep shared project config, ignore local overrides
+.claude/settings.local.json

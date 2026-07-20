@@ -1,0 +1,20 @@
+{
+  "name": "@platform/widget",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "preact": "^10.25.4",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.5",
+    "typescript": "^5.9.3",
+    "vite": "^6.3.5"
+  }
+}
