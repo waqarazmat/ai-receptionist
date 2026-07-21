@@ -6,7 +6,10 @@ from sending response_required to receiving the first (post-filler) chunk,
 per turn. Also validates ping_pong handling at the end.
 
 Usage (from backend/):
-    python tests/latency_bench_2_websocket.py [--port 8001]
+    # Local backend on the port the local uvicorn is bound to:
+    python tests/latency_bench_2_websocket.py --port 8001
+    # OR — deployed Railway backend (accepts full URL prefix so wss:// works):
+    python tests/latency_bench_2_websocket.py --url wss://ai-receptionist-production-0400.up.railway.app
 """
 
 from __future__ import annotations
@@ -39,9 +42,9 @@ TURNS = [
 ]
 
 
-async def run_bench(port: int):
+async def run_bench(base_url: str):
     call_id = f"bench2-{int(time.time())}"
-    url = f"ws://localhost:{port}/api/public/retell/llm/{ORG_ID}/{call_id}"
+    url = f"{base_url.rstrip('/')}/api/public/retell/llm/{ORG_ID}/{call_id}"
     print(f"Connecting to {url}\n")
 
     results = []
@@ -139,9 +142,16 @@ async def run_bench(port: int):
 
 def main():
     ap = argparse.ArgumentParser()
+    # Two ways to point the bench:
+    #   --port N          → ws://localhost:N (local backend)
+    #   --url wss://…     → any full URL prefix (deployed backend)
+    # --url wins if both are supplied.
     ap.add_argument("--port", type=int, default=8001)
+    ap.add_argument("--url", type=str, default=None,
+                    help="Full URL prefix, e.g. wss://…up.railway.app. Overrides --port.")
     args = ap.parse_args()
-    asyncio.run(run_bench(args.port))
+    base = args.url if args.url else f"ws://localhost:{args.port}"
+    asyncio.run(run_bench(base))
 
 
 if __name__ == "__main__":

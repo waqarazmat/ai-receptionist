@@ -51,7 +51,18 @@ async def lifespan(app: FastAPI):
     logger.info("shutdown_complete")
 
 
-app = FastAPI(title="AI Receptionist API", lifespan=lifespan)
+# Hide the interactive schema surface in production — /docs and /redoc list
+# every endpoint (including super-admin routes) and expose their pydantic
+# schemas. Handy in dev, unnecessary attack-surface in prod. This does NOT
+# affect functional routes; only the discovery/UI endpoints are gated.
+_is_prod = settings.APP_ENV == "production"
+app = FastAPI(
+    title="AI Receptionist API",
+    lifespan=lifespan,
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
+)
 
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(
