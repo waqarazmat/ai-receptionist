@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,3 +19,11 @@ class User(Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     last_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Bumped on logout and on deactivation so any refresh token that carries an
+    # older value is instantly invalidated. Embedded in every access/refresh
+    # token; the /refresh endpoint rejects mismatches (see app/api/auth/jwt.py
+    # and app/api/auth/router.py). Non-nullable with server default 1 so
+    # existing rows and new-user creation both have a sane starting value.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", default=1
+    )

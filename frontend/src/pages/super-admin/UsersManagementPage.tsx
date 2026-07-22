@@ -13,6 +13,7 @@ import { Skeleton } from "../../components/ui/Skeleton";
 import { DataTable, type DataTableColumn } from "../../components/shared/DataTable";
 import { SearchInput } from "../../components/shared/SearchInput";
 import { InviteUserModal } from "../../features/users/InviteUserModal";
+import { formatRelative } from "../../lib/format";
 import type { User, UserListFilters, UserRole } from "../../types/user";
 
 const ROLE_OPTIONS: { value: UserRole | ""; label: string }[] = [
@@ -26,23 +27,6 @@ const STATUS_OPTIONS: { value: "" | "true" | "false"; label: string }[] = [
   { value: "true", label: "Active" },
   { value: "false", label: "Inactive" },
 ];
-
-function formatRelative(iso: string | null): string {
-  if (!iso) return "Never";
-  const then = new Date(iso).getTime();
-  const diff = Date.now() - then;
-  if (diff < 0) return "just now";
-  const minutes = Math.floor(diff / 60_000);
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months}mo ago`;
-  return new Date(iso).toLocaleDateString();
-}
 
 export default function UsersManagementPage() {
   const currentUser = useAuthStore((s) => s.user);

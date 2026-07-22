@@ -9,6 +9,8 @@ from app.security.rate_limiter import (
     check_otp_request_limit,
     increment_otp_attempts,
     increment_otp_requests,
+    is_otp_locked,
+    record_otp_abuse,
 )
 
 logger = structlog.get_logger()
@@ -23,11 +25,25 @@ def generate_otp() -> str:
 async def store_otp(email: str, code: str) -> bool:
     """Store the OTP if the hourly request limit hasn't been exceeded.
 
-    Returns False when rate-limited — the caller still returns its generic
-    "check your email" response either way, it just skips sending the email.
+    Returns False when rate-limited OR when the email is under a second-tier
+    abuse lock (see rate_limiter.record_otp_abuse). Callers still return
+    the generic "check your email" response either way — this function is
+    the only place that decides whether to actually persist and send.
     """
-    if not await check_otp_request_limit(email):
+    # Second-tier lock supersedes the per-email rate limit: an actively-abused
+    # email short-circuits without leaking the fact via a different response.
+    if await is_otp_locked(email):
+        logger.warning("otp_locked", email=email)
         return False
+
+    if not await check_otp_request_limit(email):
+        # Rate-limit hit — count this toward the abuse threshold and, if the
+        # threshold trips, lock the email out entirely.
+        locked_now = await record_otp_abuse(email)
+        if locked_now:
+            logger.warning("otp_abuse_lock_triggered", email=email)
+        return False
+
     await increment_otp_requests(email)
     await redis_client.set(f"otp:{email}", code, ex=OTP_TTL_SECONDS)
 

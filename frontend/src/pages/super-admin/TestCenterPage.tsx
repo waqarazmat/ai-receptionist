@@ -200,7 +200,7 @@ function VoiceTestCard({
           <Button
             className="w-full"
             onClick={() =>
-              window.open(`https://dashboard.retell.ai/agents/${retellAgentId}`, "_blank", "noopener,noreferrer")
+              window.open(`https://dashboard.retellai.com/agents/${retellAgentId}`, "_blank", "noopener,noreferrer")
             }
           >
             <ExternalLink className="h-4 w-4" />

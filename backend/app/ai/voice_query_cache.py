@@ -73,6 +73,25 @@ async def get_cached_chunks(org_id: str, query: str) -> list[dict] | None:
         return None
 
 
+async def invalidate_org(org_id: str) -> int:
+    """Drop every cached voice-query answer for this org. Call this from any
+    write path that mutates knowledge chunks (add/update/delete/replace/crawl)
+    — otherwise callers keep hearing the pre-edit answer for up to the TTL
+    (~5 min) after staff updates the KB. Returns the number of keys dropped
+    for observability; safe to ignore. Never raises."""
+    pattern = f"{_KEY_PREFIX}:{org_id}:*"
+    dropped = 0
+    try:
+        async for key in redis_client.scan_iter(match=pattern):
+            await redis_client.delete(key)
+            dropped += 1
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("voice_qcache_invalidate_failed", org_id=org_id, error=str(exc))
+        return 0
+    logger.info("voice_qcache_invalidated", org_id=org_id, keys_dropped=dropped)
+    return dropped
+
+
 async def set_cached_chunks(org_id: str, query: str, chunks: list) -> None:
     """Persist the chunk payloads under the normalized query key. Only stores
     content + score (not chunk_id / embedding) because that's all downstream

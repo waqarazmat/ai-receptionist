@@ -12,8 +12,8 @@ from app.ai.embeddings import embed_text
 from app.ai.llm_router import (
     LLMProviderError,
     NoLLMProviderConfiguredError,
-    get_org_llm_client,
-    stream_llm,
+    get_org_llm_clients,
+    stream_llm_with_fallback,
 )
 from app.ai.prompts.receptionist_system import get_system_prompt
 from app.ai.rag_pipeline import ChunkResult, hybrid_search
@@ -178,15 +178,18 @@ async def _prime_llm_client(state: _CallState, org_id: uuid.UUID, call_id: str) 
     t0 = time.monotonic()
     try:
         async with async_session_maker() as db:
-            client = await get_org_llm_client(db, org_id, model_tier="fast")
+            # Prime the FULL fallback list (primary + secondaries) so a
+            # provider outage mid-call can fail over on the next turn.
+            clients = await get_org_llm_clients(db, org_id, model_tier="fast")
         logger.info(
             "voice_llm_client_ms",
             org_id=str(org_id),
             call_id=call_id,
             latency_ms=round((time.monotonic() - t0) * 1000),
+            providers=[c.provider.value for c in clients],
         )
         if not state.llm_client_future.done():
-            state.llm_client_future.set_result(client)
+            state.llm_client_future.set_result(clients)
     except Exception as exc:  # noqa: BLE001 — propagate to the awaiting turn
         if not state.llm_client_future.done():
             state.llm_client_future.set_exception(exc)
@@ -584,14 +587,15 @@ async def _handle_turn(
             async with async_session_maker() as db:
                 await add_message(db, conversation_id, MessageRole.ai, FALLBACK_MESSAGE, Channel.voice)
             return
-        client = client_result
+        # client_result is now a LIST[OrgLLMClient] (primary + fallbacks).
+        clients = client_result
     else:
         # Priming was never scheduled (shouldn't happen post-accept), do it
         # synchronously as a fallback so the turn still works.
         client_start = time.monotonic()
         try:
             async with async_session_maker() as db:
-                client = await get_org_llm_client(db, org_id, model_tier="fast")
+                clients = await get_org_llm_clients(db, org_id, model_tier="fast")
         except NoLLMProviderConfiguredError as exc:
             logger.warning("no_llm_provider_configured", org_id=str(org_id), error=str(exc))
             await sender.send_shortcut(response_id, FALLBACK_MESSAGE)
@@ -604,6 +608,7 @@ async def _handle_turn(
             call_id=call_id,
             latency_ms=round((time.monotonic() - client_start) * 1000),
             source="fallback_sync",
+            providers=[c.provider.value for c in clients],
         )
 
     # Build history for the LLM: prior turns + the current user message. We
@@ -618,6 +623,7 @@ async def _handle_turn(
             "greeting": state.org_prompts.get("greeting"),
             "personality": state.org_prompts.get("personality"),
             "escalation_rules": state.org_prompts.get("escalation_rules"),
+            "custom_system_prompt": state.org_prompts.get("system_prompt"),
             "knowledge_context": knowledge_context,
             "customer_name": contact_name,
         },
@@ -630,7 +636,7 @@ async def _handle_turn(
     first_token_at: float | None = None
     first_frame_sent_at: float | None = None
     try:
-        async for token in stream_llm(client, history, system_prompt):
+        async for token in stream_llm_with_fallback(clients, history, system_prompt):
             if first_token_at is None:
                 first_token_at = time.monotonic()
                 logger.info(

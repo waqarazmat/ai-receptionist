@@ -62,5 +62,24 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
+    # Sentry error tracking — optional. When set, unhandled exceptions and
+    # explicit logger.error() calls stream to Sentry with request context.
+    # Leave blank in dev; set on Railway once a project exists in Sentry.
+    SENTRY_DSN: str | None = None
+    # Fraction of transactions sampled for performance monitoring.
+    # 0.0 = errors only (cheapest). 0.1 = 10% of requests traced.
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+
+    # IP-level request rate limit for public endpoints (applies BEFORE any
+    # per-org / per-email limits). Guards against enumeration bots and DoS.
+    IP_RATE_LIMIT_PER_MINUTE: int = 240
+
+    # Extra abuse-lockout on top of MAX_OTP_REQUESTS_PER_HOUR: if the same
+    # email keeps trying after being rate-limited, lock that email out
+    # entirely for a while. Prevents someone iterating through valid emails
+    # to trigger legitimate users' OTP quotas.
+    OTP_ABUSE_LOCK_THRESHOLD: int = 3
+    OTP_ABUSE_LOCK_SECONDS: int = 3600
+
 
 settings = Settings()

@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.embeddings import embed_batch, embed_text
+from app.ai.voice_query_cache import invalidate_org as invalidate_voice_qcache
 from app.models.knowledge_base import KnowledgeBase
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.services.crawler_service import crawl_website
@@ -81,6 +82,11 @@ async def import_from_website(db: AsyncSession, org_id: uuid.UUID, kb_id: uuid.U
             )
             chunks_created += 1
         await db.commit()
+        # Voice string-match cache holds RAG results keyed by normalized query
+        # (TTL ~5 min). A crawl either adds new content or replaces an old
+        # crawl's content — either way, any cached voice answer is now
+        # potentially stale. Drop them so the next call embeds fresh.
+        await invalidate_voice_qcache(str(org_id))
 
     return {
         "provider": result["provider"],
@@ -104,6 +110,7 @@ async def add_chunk(
     db.add(chunk)
     await db.commit()
     await db.refresh(chunk)
+    await invalidate_voice_qcache(str(org_id))
     return chunk
 
 
@@ -124,6 +131,9 @@ async def update_chunk(
         chunk.metadata_ = {**(chunk.metadata_ or {}), "title": title}
     await db.commit()
     await db.refresh(chunk)
+    # Use the chunk's own org_id here — the caller may not have passed one
+    # (see comment on org_id above), but the chunk row we loaded certainly has it.
+    await invalidate_voice_qcache(str(chunk.org_id))
     return chunk
 
 
@@ -131,8 +141,10 @@ async def delete_chunk(db: AsyncSession, chunk_id: uuid.UUID, org_id: uuid.UUID 
     chunk = await db.get(KnowledgeChunk, chunk_id)
     if chunk is None or (org_id is not None and chunk.org_id != org_id):
         raise ChunkNotFoundError(str(chunk_id))
+    chunk_org_id = chunk.org_id
     await db.delete(chunk)
     await db.commit()
+    await invalidate_voice_qcache(str(chunk_org_id))
 
 
 async def get_or_create_org_knowledge_base(
@@ -200,6 +212,7 @@ async def replace_knowledge_base(
 
     await db.commit()
     await db.refresh(kb)
+    await invalidate_voice_qcache(str(org_id))
     return kb
 
 

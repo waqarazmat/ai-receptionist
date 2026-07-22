@@ -4,7 +4,13 @@ from dataclasses import dataclass
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.llm_router import LLMProviderError, NoLLMProviderConfiguredError, OrgLLMClient, call_llm, get_org_llm_client
+from app.ai.llm_router import (
+    LLMProviderError,
+    NoLLMProviderConfiguredError,
+    OrgLLMClient,
+    call_llm,
+    get_org_llm_clients,
+)
 from app.ai.prompts.receptionist_system import get_system_prompt
 from app.ai.rag_pipeline import ChunkResult
 from app.models.organization import Organization
@@ -26,11 +32,15 @@ _HISTORY_ROLE_MAP = {"customer": "user", "ai": "assistant"}
 class GenerationPlan:
     """Either a ready-to-send shortcut (escalation/off-topic/no-provider-configured),
     or everything needed to actually call an LLM. Exactly one of `shortcut_text`
-    or `client` is set. Shared by generate_response (non-streaming) and the
-    webchat handler (streaming) so the prompt-building logic isn't duplicated."""
+    or `clients` is set. Shared by generate_response (non-streaming) and the
+    webchat handler (streaming) so the prompt-building logic isn't duplicated.
+
+    `clients` is the ordered fallback list — primary at index 0. Both the
+    streaming and non-streaming paths iterate through it if the primary
+    errors before returning any text (see stream_llm_with_fallback)."""
 
     shortcut_text: str | None = None
-    client: OrgLLMClient | None = None
+    clients: list[OrgLLMClient] | None = None
     messages: list[dict] | None = None
     system_prompt: str | None = None
 
@@ -59,6 +69,7 @@ async def build_generation_plan(
             "greeting": prompts.get("greeting"),
             "personality": prompts.get("personality"),
             "escalation_rules": prompts.get("escalation_rules"),
+            "custom_system_prompt": prompts.get("system_prompt"),
             "knowledge_context": knowledge_context,
             "customer_name": contact_name,
         }
@@ -73,12 +84,12 @@ async def build_generation_plan(
         history_messages = [{"role": "user", "content": "Hello"}]
 
     try:
-        client = await get_org_llm_client(db, org_id, model_tier="quality")
+        clients = await get_org_llm_clients(db, org_id, model_tier="quality")
     except NoLLMProviderConfiguredError as exc:
         logger.warning("no_llm_provider_configured", org_id=str(org_id), error=str(exc))
         return GenerationPlan(shortcut_text=FALLBACK_MESSAGE)
 
-    return GenerationPlan(client=client, messages=history_messages, system_prompt=system_prompt)
+    return GenerationPlan(clients=clients, messages=history_messages, system_prompt=system_prompt)
 
 
 async def generate_response(
@@ -93,8 +104,19 @@ async def generate_response(
     if plan.shortcut_text is not None:
         return plan.shortcut_text
 
-    try:
-        return await call_llm(plan.client, messages=plan.messages, system_prompt=plan.system_prompt)
-    except LLMProviderError as exc:
-        logger.warning("response_generation_failed", org_id=str(org_id), intent=intent, error=str(exc))
-        return FALLBACK_MESSAGE
+    # Non-streaming path — iterate the fallback list ourselves. call_llm
+    # is a single-provider call, so we short-circuit on the first success.
+    last_error: LLMProviderError | None = None
+    for client in plan.clients or []:
+        try:
+            return await call_llm(client, messages=plan.messages, system_prompt=plan.system_prompt)
+        except LLMProviderError as exc:
+            last_error = exc
+            logger.warning(
+                "response_generation_fallback",
+                org_id=str(org_id),
+                provider=client.provider.value,
+                error=str(exc),
+            )
+    logger.warning("response_generation_failed", org_id=str(org_id), intent=intent, error=str(last_error))
+    return FALLBACK_MESSAGE

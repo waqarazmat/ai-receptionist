@@ -76,6 +76,11 @@ class SystemPromptsStep(BaseModel):
     personality: str
     escalation_rules: str
     off_topic_response: str
+    # Free-form custom system prompt appended to the built prompt (see
+    # app/ai/prompts/receptionist_system.py). Lets an org add extra guardrails,
+    # brand voice quirks, or industry-specific context on top of the structured
+    # fields above. Optional — the wizard passes an empty string when unused.
+    system_prompt: str | None = None
 
 
 class StaffAccessStep(BaseModel):

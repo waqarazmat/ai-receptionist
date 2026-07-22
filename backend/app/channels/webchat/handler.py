@@ -4,7 +4,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.embeddings import embed_text
-from app.ai.llm_router import LLMProviderError, stream_llm
+from app.ai.llm_router import LLMProviderError, stream_llm_with_fallback
 from app.ai.message_analyzer import analyze_message
 from app.ai.rag_pipeline import hybrid_search
 from app.ai.response_generator import DEFAULT_OFF_TOPIC_MESSAGE, ESCALATION_MESSAGE, FALLBACK_MESSAGE, build_generation_plan
@@ -229,7 +229,7 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
 
         collected: list[str] = []
         try:
-            async for token in stream_llm(plan.client, plan.messages, plan.system_prompt):
+            async for token in stream_llm_with_fallback(plan.clients, plan.messages, plan.system_prompt):
                 collected.append(token)
                 await sio.emit("response_token", {"token": token}, to=sid, namespace="/chat")
         except LLMProviderError as exc:

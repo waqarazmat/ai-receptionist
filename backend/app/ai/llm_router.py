@@ -89,7 +89,15 @@ def _build_sdk(provider: ApiKeyProvider, api_key: str) -> Any:
     raise ValueError(f"Unsupported provider: {provider}")
 
 
-async def get_org_llm_client(db: AsyncSession, org_id: uuid.UUID, model_tier: ModelTier = "fast") -> OrgLLMClient:
+async def get_org_llm_clients(
+    db: AsyncSession, org_id: uuid.UUID, model_tier: ModelTier = "fast"
+) -> list[OrgLLMClient]:
+    """Return EVERY configured provider for the org in priority order.
+
+    Used by stream_llm_with_fallback below to keep the call alive when the
+    primary provider errors before the first token. Callers that only need
+    the primary can still use get_org_llm_client() which is a thin wrapper.
+    """
     result = await db.execute(
         select(OrgApiKey).where(
             OrgApiKey.org_id == org_id,
@@ -99,22 +107,30 @@ async def get_org_llm_client(db: AsyncSession, org_id: uuid.UUID, model_tier: Mo
     )
     keys_by_provider = {row.provider: row for row in result.scalars().all()}
 
-    # Fast and quality tiers use different provider preference orders (Haiku
-    # first for fast, GPT-4o-mini first for quality).
     if model_tier == "quality":
         priority, models = QUALITY_PROVIDER_PRIORITY, QUALITY_MODELS
     else:
         priority, models = PROVIDER_PRIORITY, FAST_MODELS
 
+    clients: list[OrgLLMClient] = []
     for provider in priority:
         key_row = keys_by_provider.get(provider)
         if key_row is None:
             continue
         api_key = decrypt_api_key(str(org_id), key_row.encrypted_key)
         sdk = _build_sdk(provider, api_key)
-        return OrgLLMClient(provider=provider, model=models[provider], api_key=api_key, sdk=sdk)
+        clients.append(OrgLLMClient(provider=provider, model=models[provider], api_key=api_key, sdk=sdk))
 
-    raise NoLLMProviderConfiguredError(f"No LLM provider configured for org {org_id}")
+    if not clients:
+        raise NoLLMProviderConfiguredError(f"No LLM provider configured for org {org_id}")
+    return clients
+
+
+async def get_org_llm_client(db: AsyncSession, org_id: uuid.UUID, model_tier: ModelTier = "fast") -> OrgLLMClient:
+    """Legacy single-client accessor — returns the first (primary) configured
+    provider. Prefer get_org_llm_clients() + stream_llm_with_fallback() for
+    new callsites so a primary outage doesn't kill the call."""
+    return (await get_org_llm_clients(db, org_id, model_tier))[0]
 
 
 def _sdk(client: OrgLLMClient) -> Any:
@@ -273,6 +289,74 @@ async def stream_llm(client: OrgLLMClient, messages: list[dict], system_prompt: 
     except Exception as exc:
         logger.warning("llm_stream_failed", provider=client.provider.value, model=client.model, error=str(exc))
         raise LLMProviderError(f"{client.provider.value} stream failed: {exc}") from exc
+
+
+async def stream_llm_with_fallback(
+    clients: list[OrgLLMClient], messages: list[dict], system_prompt: str
+) -> AsyncIterator[str]:
+    """Try each client in `clients` in order. If the primary raises BEFORE
+    yielding any tokens, seamlessly try the next. Once a token has been
+    yielded, we're committed — a mid-stream failure propagates as
+    LLMProviderError so the caller can render whatever text arrived so far
+    (see how retell_handler's response builder appends a fallback message
+    to `collected` on failure).
+
+    Rationale: an Anthropic outage in the middle of a call shouldn't kill the
+    conversation if the org has an OpenAI key too. Provider status pages
+    show ~4-6 outages per year each; without fallback, that's ~10 hours of
+    outage per year exposed to end users. With fallback the outages have to
+    line up in the same 30s window.
+    """
+    if not clients:
+        raise NoLLMProviderConfiguredError("stream_llm_with_fallback called with no clients")
+
+    last_error: Exception | None = None
+    for idx, client in enumerate(clients):
+        handler = _STREAM_HANDLERS.get(client.provider)
+        if handler is None:
+            last_error = LLMProviderError(f"Unsupported provider: {client.provider}")
+            continue
+
+        logger.info(
+            "llm_stream_fallback_attempt",
+            provider=client.provider.value,
+            model=client.model,
+            attempt=idx + 1,
+            fallback=idx > 0,
+        )
+        yielded_any = False
+        try:
+            async for token in handler(client, messages, system_prompt):
+                yielded_any = True
+                yield token
+            # Provider finished successfully — done.
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if yielded_any:
+                # Mid-stream failure — we've already committed to this provider
+                # (the client has partial output). Fall through to LLMProviderError.
+                logger.warning(
+                    "llm_stream_failed_mid_stream",
+                    provider=client.provider.value,
+                    model=client.model,
+                    error=str(exc),
+                )
+                raise LLMProviderError(
+                    f"{client.provider.value} stream failed mid-response: {exc}"
+                ) from exc
+            # No tokens yet — try the next client.
+            logger.warning(
+                "llm_stream_fallback_next",
+                provider=client.provider.value,
+                model=client.model,
+                remaining=len(clients) - idx - 1,
+                error=str(exc),
+            )
+            continue
+
+    # All providers exhausted before any token.
+    raise LLMProviderError(f"All {len(clients)} providers failed. Last error: {last_error}")
 
 
 def parse_json_response(raw: str) -> dict:

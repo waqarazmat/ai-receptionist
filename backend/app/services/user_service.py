@@ -156,6 +156,16 @@ async def update_user(
         user.org_id = data.org_id
 
     if data.is_active is not None:
+        # Deactivation must also invalidate all outstanding refresh tokens —
+        # without this, a deactivated user could keep refreshing for up to 7
+        # days. Bumping token_version does that in a single field-write and
+        # is checked in /api/auth/refresh (see app/api/auth/router.py).
+        # Reactivation intentionally does NOT bump — the previous session's
+        # tokens have already expired by then in any practical timeline, and
+        # a bump would force the reactivated user to re-login, which is
+        # surprising UX.
+        if user.is_active and not data.is_active:
+            user.token_version = (user.token_version or 1) + 1
         user.is_active = data.is_active
 
     await db.commit()

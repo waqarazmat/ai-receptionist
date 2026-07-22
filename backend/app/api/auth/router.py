@@ -1,7 +1,6 @@
 import uuid
 from datetime import datetime, timezone
 
-import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -9,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.jwt import create_access_token, create_refresh_token, decode_token
 from app.api.auth.otp import generate_otp, store_otp, verify_otp
+from app.api.deps import get_current_user
 from app.db.engine import get_session
 from app.models.user import User
 from app.schemas.auth import (
@@ -19,7 +19,7 @@ from app.schemas.auth import (
     TokenResponse,
     VerifyOtpRequest,
 )
-from app.utils.email import send_otp_email
+from app.utils.email import EmailDeliveryError, send_otp_email
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -35,17 +35,42 @@ async def request_otp(body: RequestOtpRequest, session: AsyncSession = Depends(g
     )
     user = result.scalar_one_or_none()
 
-    # Email-enumeration prevention: identical response regardless of whether
-    # the email exists, is inactive, or is rate-limited — only the side
-    # effects (OTP stored + email sent) differ.
-    if user is not None:
-        code = generate_otp()
-        stored = await store_otp(body.email, code)
-        if stored:
-            try:
-                await send_otp_email(body.email, code)
-            except httpx.HTTPError:
-                logger.warning("otp_email_send_failed", email=body.email)
+    # Email-enumeration prevention: for a NON-existent (or inactive) email
+    # we return the generic response with no side effects. This branch keeps
+    # that property.
+    if user is None:
+        return MessageResponse(message=GENERIC_OTP_MESSAGE)
+
+    code = generate_otp()
+    stored = await store_otp(body.email, code)
+    if not stored:
+        # Hourly OTP request cap hit — same generic message so callers can't
+        # tell rate-limiting apart from a fresh send. Rate-limiter already
+        # logged the hit internally.
+        return MessageResponse(message=GENERIC_OTP_MESSAGE)
+
+    # Real user, OTP in Redis, now try to deliver it. On failure we prefer
+    # to surface the error to the caller so they can retry, rather than
+    # silently claim success while their inbox stays empty. This does mean
+    # a Brevo outage becomes distinguishable from a non-existent-email
+    # response (existent-broken -> 502, non-existent -> 200 generic) — an
+    # enumeration hint we accept in exchange for a working retry UX. If
+    # the enumeration property becomes critical, revisit by queueing sends
+    # via Arq and always returning 200 here.
+    try:
+        await send_otp_email(body.email, code)
+    except EmailDeliveryError as exc:
+        logger.warning(
+            "otp_email_send_failed",
+            email=body.email,
+            status_code=exc.status_code,
+            # exc.body already truncated to 2000 chars inside send_otp_email.
+            response_body=exc.body,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not send verification email. Please try again in a moment.",
+        )
 
     return MessageResponse(message=GENERIC_OTP_MESSAGE)
 
@@ -68,8 +93,8 @@ async def verify_otp_endpoint(
     await session.commit()
 
     org_id = str(user.org_id) if user.org_id else None
-    access_token = create_access_token(str(user.id), user.role.value, org_id)
-    refresh_token = create_refresh_token(str(user.id))
+    access_token = create_access_token(str(user.id), user.role.value, org_id, user.token_version)
+    refresh_token = create_refresh_token(str(user.id), user.token_version)
 
     return TokenResponse(access_token=access_token, refresh_token=refresh_token)
 
@@ -89,7 +114,29 @@ async def refresh(body: RefreshRequest, session: AsyncSession = Depends(get_sess
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 
+    # Token-version check: any refresh token issued BEFORE user.token_version
+    # was bumped (via logout or deactivate) is now dead. Rejecting here is
+    # what makes the 7-day refresh window collapse to "immediately" for
+    # deactivated / logged-out users.
+    token_version = payload.get("tv")
+    if token_version is None or int(token_version) != user.token_version:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked")
+
     org_id = str(user.org_id) if user.org_id else None
-    access_token = create_access_token(str(user.id), user.role.value, org_id)
+    access_token = create_access_token(str(user.id), user.role.value, org_id, user.token_version)
 
     return AccessTokenResponse(access_token=access_token)
+
+
+@router.post("/logout", response_model=MessageResponse)
+async def logout(
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    """Revoke every refresh token that was ever issued to this user by bumping
+    their token_version. Access tokens issued in the last 30 min still work
+    until they expire — that's the deliberate exposure window for keeping the
+    per-request path fast (no DB read per authenticated call)."""
+    current_user.token_version = (current_user.token_version or 1) + 1
+    await session.commit()
+    return MessageResponse(message="Signed out.")

@@ -81,6 +81,10 @@ export interface SystemPromptsStep {
   personality: string;
   escalation_rules: string;
   off_topic_response: string;
+  // Free-form custom prompt appended to the assembled system prompt on the
+  // backend (see backend/app/ai/prompts/receptionist_system.py). Optional —
+  // wizard sends an empty string when unused.
+  system_prompt?: string | null;
 }
 
 export interface StaffAccessStep {

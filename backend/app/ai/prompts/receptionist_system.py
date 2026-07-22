@@ -6,6 +6,11 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
         greeting: str | None
         personality: str | None
         escalation_rules: str | None
+        custom_system_prompt: str | None — free-form org-authored block (from
+            the setup wizard's Custom System Prompt field). Injected verbatim
+            after the structured sections but BEFORE the knowledge context, so
+            it can add brand-voice rules, industry guardrails, or overrides
+            the generic guidelines. Empty/None = skipped.
         knowledge_context: str  — retrieved chunks, already formatted, "" if none
         customer_name: str | None
 
@@ -21,6 +26,7 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
         org_config.get("escalation_rules")
         or "Escalate to a human whenever the customer explicitly asks for one, or seems upset."
     )
+    custom_system_prompt = (org_config.get("custom_system_prompt") or "").strip()
     knowledge_context = org_config.get("knowledge_context") or ""
     customer_name = org_config.get("customer_name")
 
@@ -66,6 +72,13 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
             "keep replies to one or two short sentences; speak numbers, times, and prices as "
             "a person would say them (e.g. \"nine AM\", not \"9:00 AM\")."
         )
+
+    if custom_system_prompt:
+        # Injected verbatim so orgs can add brand-voice rules, industry
+        # guardrails, or override the generic guidelines above. Placed AFTER
+        # the guidelines so it wins on conflicts (later instructions in a
+        # system prompt take precedence in practice for Claude/GPT/Cohere).
+        lines += ["", "Additional instructions from the business:", custom_system_prompt]
 
     if knowledge_context:
         lines += ["", "Relevant knowledge for this conversation:", knowledge_context]

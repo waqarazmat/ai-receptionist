@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from app.config import settings
 from app.db.redis import redis_client
 
 MAX_OTP_REQUESTS_PER_HOUR = 5
@@ -24,6 +25,36 @@ async def increment_otp_requests(email: str) -> None:
     # original TTL untouched so this is a fixed 1-hour window, not a rolling one.
     if not await redis_client.set(key, 1, ex=OTP_REQUEST_WINDOW_SECONDS, nx=True):
         await redis_client.incr(key)
+
+
+async def is_otp_locked(email: str) -> bool:
+    """Second-tier abuse guard on top of MAX_OTP_REQUESTS_PER_HOUR: after N
+    rate-limit hits within an hour, the email itself is locked for
+    OTP_ABUSE_LOCK_SECONDS. Prevents someone iterating requests to lock
+    real users out of their own quota. Checked BEFORE the per-code and
+    per-email limits so a locked email quickly short-circuits."""
+    return bool(await redis_client.get(f"otp_lock:{email}"))
+
+
+async def record_otp_abuse(email: str) -> bool:
+    """Call when an OTP request was rejected by the per-email limit — this
+    tracks the abuse pattern separately. When the abuse counter crosses the
+    threshold, sets the lock. Returns True if this call flipped the lock on.
+
+    The abuse counter itself has a 1-hour TTL, matching the request window,
+    so the threshold is "N rate-limit hits per hour" not "N ever."
+    """
+    key = f"otp_abuse:{email}"
+    if not await redis_client.set(key, 1, ex=OTP_REQUEST_WINDOW_SECONDS, nx=True):
+        count = await redis_client.incr(key)
+    else:
+        count = 1
+    if count >= settings.OTP_ABUSE_LOCK_THRESHOLD:
+        await redis_client.set(
+            f"otp_lock:{email}", 1, ex=settings.OTP_ABUSE_LOCK_SECONDS
+        )
+        return True
+    return False
 
 
 async def check_otp_attempt_limit(email: str, otp_code: str) -> bool:

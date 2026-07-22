@@ -6,6 +6,13 @@
 builder = "NIXPACKS"
 
 [deploy]
+# Run migrations before every deploy. Railway executes preDeployCommand in
+# a one-shot container that shares the same env + network as the service,
+# so `alembic upgrade head` reaches the same Postgres. If it fails, the
+# deploy aborts and the previous version keeps serving — no half-migrated
+# state, no manual `railway ssh` after every schema change.
+preDeployCommand = "alembic upgrade head"
+
 # $PORT is injected by Railway per deploy — never hardcode.
 startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
