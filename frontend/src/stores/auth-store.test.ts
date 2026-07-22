@@ -6,6 +6,7 @@ const SAMPLE_USER: User = {
   id: "user-123",
   email: "admin@example.com",
   role: "super_admin",
+  org_id: null,
 };
 
 const TOKENS = { accessToken: "access-abc", refreshToken: "refresh-xyz" };

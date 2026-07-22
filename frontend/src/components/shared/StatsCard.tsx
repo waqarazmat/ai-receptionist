@@ -17,9 +17,11 @@ export interface StatsCardProps {
   icon?: ReactNode;
   /** Soft colored circle behind the icon. */
   tone?: StatTone;
+  /** Small caption under the value — e.g. "42 avg/day" or "of 12 total". */
+  hint?: string;
 }
 
-export function StatsCard({ label, value, icon, tone = "indigo" }: StatsCardProps) {
+export function StatsCard({ label, value, icon, tone = "indigo", hint }: StatsCardProps) {
   // Brief scale pulse whenever the value changes (e.g. a realtime count bump).
   const [pulse, setPulse] = useState(false);
   const prev = useRef(value);
@@ -51,6 +53,11 @@ export function StatsCard({ label, value, icon, tone = "indigo" }: StatsCardProp
           {value}
         </span>
       </p>
+      {hint && (
+        <p className="mt-1 text-xs font-medium text-slate-400 dark:text-slate-500">
+          {hint}
+        </p>
+      )}
     </div>
   );
 }

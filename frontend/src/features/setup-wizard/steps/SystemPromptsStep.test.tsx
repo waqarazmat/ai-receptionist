@@ -13,9 +13,7 @@ import type { StepComponentProps } from "../types";
 
 // The wizard passes a big SetupStateResponse — we only care about the parts
 // this step reads, so a partial cast is fine and keeps the test focused.
-function baseProps(
-  overrides: Partial<StepComponentProps["setupState"]> = {},
-): StepComponentProps {
+function baseProps(): StepComponentProps {
   return {
     orgId: "org-1",
     setupState: {
