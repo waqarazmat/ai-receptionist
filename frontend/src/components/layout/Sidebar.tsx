@@ -12,6 +12,7 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
+  Wallet,
   type LucideIcon,
 } from "lucide-react";
 import { useEscalations } from "../../api/escalations";
@@ -28,6 +29,7 @@ const superAdminNav: NavItem[] = [
   { to: "/admin/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { to: "/admin/organizations", label: "Organizations", icon: Building2 },
   { to: "/admin/users", label: "Users", icon: Users },
+  { to: "/admin/billing", label: "Billing", icon: Wallet },
   { to: "/admin/audit-logs", label: "Audit Logs", icon: ScrollText },
 ];
 
@@ -38,6 +40,7 @@ const orgStaffNav: NavItem[] = [
   { to: "/org/knowledge-base", label: "Knowledge Base", icon: BookOpen },
   { to: "/org/escalations", label: "Escalations", icon: AlertTriangle },
   { to: "/org/contacts", label: "Contacts", icon: Contact },
+  { to: "/org/billing", label: "Billing", icon: Wallet },
   { to: "/org/settings", label: "Settings", icon: Settings },
 ];
 

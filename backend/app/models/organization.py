@@ -1,8 +1,9 @@
-from sqlalchemy import Boolean, String
+from sqlalchemy import Boolean, Enum, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.models.enums import BillingPlan
 
 
 class Organization(Base):
@@ -15,6 +16,14 @@ class Organization(Base):
     working_hours: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_trial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Subscription tier. All new orgs land on `free`. Per-plan quotas live
+    # in app.billing.plans so tuning them doesn't need a migration.
+    plan: Mapped[BillingPlan] = mapped_column(
+        Enum(BillingPlan, name="billing_plan"),
+        nullable=False,
+        default=BillingPlan.free,
+        server_default=BillingPlan.free.value,
+    )
     channels_enabled: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=lambda: {"webchat": False, "whatsapp": False, "voice": False}
     )

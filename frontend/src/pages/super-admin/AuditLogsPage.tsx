@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { ChevronLeft, ChevronRight, ScrollText } from "lucide-react";
+import { ChevronLeft, ChevronRight, Download, ScrollText } from "lucide-react";
 import { useAuditLogs } from "../../api/audit-logs";
 import { DataTable, type DataTableColumn } from "../../components/shared/DataTable";
 import { EmptyState } from "../../components/shared/EmptyState";
 import { Button } from "../../components/ui/Button";
 import { Input } from "../../components/ui/Input";
 import { Spinner } from "../../components/ui/Spinner";
+import { downloadCsv } from "../../lib/csv-download";
 import { formatActionLabel, formatDateTime } from "../../lib/utils";
 import type { AuditLogEntry } from "../../types/audit-log";
 
@@ -48,10 +49,28 @@ export default function AuditLogsPage() {
 
   const totalPages = data ? Math.max(1, Math.ceil(data.total / PAGE_SIZE)) : 1;
 
+  const [isExporting, setIsExporting] = useState(false);
+  const handleExport = async () => {
+    setIsExporting(true);
+    try {
+      await downloadCsv("/api/admin/audit-logs/export.csv", "audit-logs.csv");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   return (
     <div>
-      <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">Audit Logs</h2>
-      <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">Every super-admin action, in order.</p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-slate-100">Audit Logs</h2>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">Every super-admin action, in order.</p>
+        </div>
+        <Button variant="secondary" onClick={handleExport} isLoading={isExporting}>
+          <Download className="h-4 w-4" />
+          Export CSV
+        </Button>
+      </div>
 
       <div className="mt-4 flex flex-wrap items-end gap-3">
         <Input

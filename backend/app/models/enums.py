@@ -49,3 +49,13 @@ class ApiKeyProvider(str, enum.Enum):
     whatsapp = "whatsapp"
     google_calendar = "google_calendar"
     retell = "retell"
+
+
+class BillingPlan(str, enum.Enum):
+    """Subscription tiers. `free` is the default at org creation.
+    Quotas live in app.billing.plans — kept out of the enum so a plan
+    tuning change doesn't need a migration."""
+    free = "free"
+    starter = "starter"
+    pro = "pro"
+    enterprise = "enterprise"

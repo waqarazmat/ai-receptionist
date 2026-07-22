@@ -147,6 +147,113 @@ async def delete_chunk(db: AsyncSession, chunk_id: uuid.UUID, org_id: uuid.UUID 
     await invalidate_voice_qcache(str(chunk_org_id))
 
 
+def _parse_csv_chunks(content: str) -> tuple[list[dict], list[str]]:
+    """CSV bulk import. Accepts either a single `content` column, or a
+    two-column format `title,content`. First row can be a header (skipped
+    if it matches keywords) or a data row (kept)."""
+    import csv as _csv
+    import io as _io
+    errors: list[str] = []
+    reader = _csv.reader(_io.StringIO(content))
+    rows = list(reader)
+    if not rows:
+        return [], ["CSV was empty"]
+    # Auto-detect header row: if first row's cells are keywords, drop it.
+    header_keywords = {"title", "content", "text", "body", "question", "answer"}
+    if any(cell.strip().lower() in header_keywords for cell in rows[0]):
+        rows = rows[1:]
+    chunks: list[dict] = []
+    for i, row in enumerate(rows, start=1):
+        if not row or not any(cell.strip() for cell in row):
+            continue
+        if len(row) == 1:
+            chunks.append({"title": None, "content": row[0].strip()})
+        else:
+            title = row[0].strip() or None
+            body = ",".join(row[1:]).strip() if len(row) > 2 else row[1].strip()
+            if not body:
+                errors.append(f"row {i}: empty content, skipped")
+                continue
+            chunks.append({"title": title, "content": body})
+    return chunks, errors
+
+
+def _parse_markdown_chunks(content: str) -> tuple[list[dict], list[str]]:
+    """Split Markdown on top-level headings (H1/H2). Everything under a
+    heading becomes one chunk with the heading text as its title. Content
+    without a heading becomes a single untitled chunk."""
+    import re as _re
+    lines = content.splitlines()
+    chunks: list[dict] = []
+    current_title: str | None = None
+    current_body: list[str] = []
+
+    def flush():
+        body = "\n".join(current_body).strip()
+        if body:
+            chunks.append({"title": current_title, "content": body})
+
+    for line in lines:
+        heading_match = _re.match(r"^\s*(#{1,2})\s+(.+?)\s*$", line)
+        if heading_match:
+            flush()
+            current_title = heading_match.group(2).strip()
+            current_body = []
+        else:
+            current_body.append(line)
+    flush()
+    if not chunks:
+        return [], ["Markdown had no non-empty content"]
+    return chunks, []
+
+
+async def bulk_import_chunks(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    kb_id: uuid.UUID,
+    format: str,
+    content: str,
+) -> dict:
+    """Parse the given content into chunks and insert them into `kb_id`.
+    Returns a summary dict — the router wraps it in the BulkImportResult
+    schema."""
+    format_lc = format.lower().strip()
+    if format_lc == "csv":
+        parsed, errors = _parse_csv_chunks(content)
+    elif format_lc == "markdown":
+        parsed, errors = _parse_markdown_chunks(content)
+    elif format_lc == "text":
+        # Fallback: treat entire payload as a single chunk. Useful for
+        # pasting a block of notes without formatting overhead.
+        parsed = [{"title": None, "content": content.strip()}] if content.strip() else []
+        errors = []
+    else:
+        return {"chunks_created": 0, "errors": [f"Unknown format: {format}"]}
+
+    if not parsed:
+        return {"chunks_created": 0, "errors": errors or ["Nothing to import"]}
+
+    # Batch-embed for speed — one CPU call for the whole payload beats N.
+    try:
+        embeddings = embed_batch([c["content"] for c in parsed])
+    except Exception as exc:  # noqa: BLE001
+        return {"chunks_created": 0, "errors": errors + [f"Embedding failed: {exc}"]}
+
+    for chunk_data, embedding in zip(parsed, embeddings, strict=True):
+        db.add(
+            KnowledgeChunk(
+                knowledge_base_id=kb_id,
+                org_id=org_id,
+                content=chunk_data["content"],
+                embedding=embedding,
+                metadata_={"title": chunk_data["title"]} if chunk_data["title"] else {},
+            )
+        )
+    await db.commit()
+    await invalidate_voice_qcache(str(org_id))
+    return {"chunks_created": len(parsed), "errors": errors}
+
+
 async def get_or_create_org_knowledge_base(
     db: AsyncSession, org_id: uuid.UUID, default_name: str = "Knowledge Base"
 ) -> KnowledgeBase:

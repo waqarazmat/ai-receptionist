@@ -51,3 +51,20 @@ class ChunkCreateRequest(BaseModel):
 class ChunkUpdateRequest(BaseModel):
     title: str | None = None
     content: str
+
+
+class BulkImportRequest(BaseModel):
+    """Bulk-import KB chunks from a plain text payload. Callers send CSV
+    (one row per chunk) or Markdown (split on top-level headings). File
+    parsing happens client-side; the API accepts plain text so this endpoint
+    stays deterministic and testable without file-multipart machinery."""
+    format: str  # "csv" | "markdown" | "text"
+    content: str
+    knowledge_base_id: uuid.UUID | None = None
+
+
+class BulkImportResult(BaseModel):
+    knowledge_base_id: uuid.UUID
+    knowledge_base_name: str
+    chunks_created: int
+    errors: list[str] = []

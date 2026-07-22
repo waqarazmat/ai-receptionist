@@ -2,7 +2,9 @@ from fastapi import APIRouter, Depends
 
 from app.api.deps import require_super_admin
 from app.api.super_admin.audit_logs import router as audit_logs_router
+from app.api.super_admin.billing import router as billing_router
 from app.api.super_admin.dashboard import router as dashboard_router
+from app.api.super_admin.exports import router as exports_router
 from app.api.super_admin.organizations import router as organizations_router
 from app.api.super_admin.setup_wizard import router as setup_wizard_router
 from app.api.super_admin.users import router as users_router
@@ -16,3 +18,5 @@ router.include_router(setup_wizard_router)
 router.include_router(dashboard_router)
 router.include_router(audit_logs_router)
 router.include_router(users_router)
+router.include_router(exports_router)
+router.include_router(billing_router)

@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_admin_db_session, require_super_admin
 from app.channels.voice import retell_provisioner
 from app.models.user import User
-from app.schemas.knowledge_base import WebsiteCrawlRequest, WebsiteCrawlResult
+from app.schemas.knowledge_base import (
+    BulkImportRequest,
+    BulkImportResult,
+    WebsiteCrawlRequest,
+    WebsiteCrawlResult,
+)
 from app.schemas.organization import OrganizationResponse
 from app.schemas.setup_wizard import (
     ApiKeysStep,
@@ -269,6 +274,61 @@ async def crawl_knowledge_base_wizard(
         ip_address=_client_ip(request),
     )
     return result
+
+
+@router.post(
+    "/organizations/{org_id}/knowledge-base/import",
+    response_model=BulkImportResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def bulk_import_knowledge_base(
+    org_id: uuid.UUID,
+    body: BulkImportRequest,
+    request: Request,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_admin_db_session),
+) -> BulkImportResult:
+    """Bulk-import KB chunks from a text payload (CSV / Markdown / plain text).
+
+    Client-side parses the uploaded file (PDF/CSV/MD) into a text string and
+    POSTs it here. Keeps this endpoint deterministic and heavy parsing deps
+    (pypdf, etc.) out of the backend."""
+    try:
+        await org_service.get_organization(db, org_id)
+    except org_service.OrganizationNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    if body.knowledge_base_id is None:
+        kb = await knowledge_base_service.get_or_create_org_knowledge_base(db, org_id)
+    else:
+        try:
+            kb = await knowledge_base_service.get_knowledge_base(db, org_id, body.knowledge_base_id)
+        except knowledge_base_service.KnowledgeBaseNotFoundError:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge base not found")
+
+    result = await knowledge_base_service.bulk_import_chunks(
+        db, org_id, kb.id, body.format, body.content
+    )
+    if result["chunks_created"] > 0:
+        org = await org_service.get_organization(db, org_id)
+        org.setup_progress = {**(org.setup_progress or {}), "knowledge_base": True}
+        await db.commit()
+
+    await log_action(
+        db,
+        user_id=current_user.id,
+        action="knowledge_base.bulk_import",
+        target_type="knowledge_base",
+        target_id=kb.id,
+        details={"format": body.format, "chunks_created": result["chunks_created"]},
+        ip_address=_client_ip(request),
+    )
+    return BulkImportResult(
+        knowledge_base_id=kb.id,
+        knowledge_base_name=kb.name,
+        chunks_created=result["chunks_created"],
+        errors=result.get("errors", []),
+    )
 
 
 @router.post("/organizations/{org_id}/knowledge-base/{kb_id}/crawl", response_model=WebsiteCrawlResult)

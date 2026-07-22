@@ -1,10 +1,12 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Globe, Plus, Trash2, Upload } from "lucide-react";
 import { useCrawlWebsite, useSaveKnowledgeBase } from "../../../api/setup-wizard";
 import { Button } from "../../../components/ui/Button";
 import { Input } from "../../../components/ui/Input";
 import { Textarea } from "../../../components/ui/Textarea";
 import { getDomain, getErrorMessage } from "../../../lib/utils";
+import { BulkImportModal } from "../../knowledge-base/BulkImportModal";
 import { StepCard } from "../StepCard";
 import { StepFooter } from "../StepFooter";
 import type { StepComponentProps } from "../types";
@@ -14,6 +16,8 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
   const [name, setName] = useState(kb?.name ?? "General FAQ");
   const [chunks, setChunks] = useState<string[]>(kb?.chunks.map((c) => c.content) ?? [""]);
   const [crawlUrl, setCrawlUrl] = useState("");
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const queryClient = useQueryClient();
 
   const saveKnowledgeBase = useSaveKnowledgeBase(orgId);
   const crawlWebsite = useCrawlWebsite(orgId);
@@ -113,9 +117,14 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
           <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
             {chunks.filter((c) => c.trim()).length} chunk{chunks.filter((c) => c.trim()).length === 1 ? "" : "s"}
           </p>
-          <Button type="button" variant="ghost" size="sm" title="Coming soon">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => setIsImportOpen(true)}
+          >
             <Upload className="h-4 w-4" />
-            Bulk Import
+            Bulk import
           </Button>
         </div>
 
@@ -148,6 +157,17 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
 
         <StepFooter onBack={onBack} isSaving={saveKnowledgeBase.isPending} />
       </form>
+
+      <BulkImportModal
+        isOpen={isImportOpen}
+        onClose={() => setIsImportOpen(false)}
+        orgId={orgId}
+        onImported={() => {
+          // Force a refetch of setup state so the freshly-imported chunks
+          // show up in the manual editor below the import button.
+          queryClient.invalidateQueries({ queryKey: ["setup-wizard", orgId] });
+        }}
+      />
     </StepCard>
   );
 }

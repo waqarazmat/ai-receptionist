@@ -10,6 +10,7 @@ import SetupWizardPage from "./pages/super-admin/SetupWizardPage";
 import TestCenterPage from "./pages/super-admin/TestCenterPage";
 import UsersManagementPage from "./pages/super-admin/UsersManagementPage";
 import AuditLogsPage from "./pages/super-admin/AuditLogsPage";
+import BillingAnalyticsPage from "./pages/super-admin/BillingAnalyticsPage";
 
 import OrgDashboardPage from "./pages/org-staff/DashboardPage";
 import InboxPage from "./pages/org-staff/InboxPage";
@@ -18,6 +19,7 @@ import KnowledgeBasePage from "./pages/org-staff/KnowledgeBasePage";
 import EscalationsPage from "./pages/org-staff/EscalationsPage";
 import ContactsPage from "./pages/org-staff/ContactsPage";
 import SettingsPage from "./pages/org-staff/SettingsPage";
+import OrgBillingPage from "./pages/org-staff/BillingPage";
 
 export const router = createBrowserRouter([
   { path: "/", element: <Navigate to="/login" replace /> },
@@ -38,6 +40,7 @@ export const router = createBrowserRouter([
       { path: "organizations/:orgId/test", element: <TestCenterPage /> },
       { path: "users", element: <UsersManagementPage /> },
       { path: "audit-logs", element: <AuditLogsPage /> },
+      { path: "billing", element: <BillingAnalyticsPage /> },
     ],
   },
   {
@@ -56,6 +59,7 @@ export const router = createBrowserRouter([
       { path: "escalations", element: <EscalationsPage /> },
       { path: "contacts", element: <ContactsPage /> },
       { path: "settings", element: <SettingsPage /> },
+      { path: "billing", element: <OrgBillingPage /> },
     ],
   },
   { path: "*", element: <Navigate to="/login" replace /> },
