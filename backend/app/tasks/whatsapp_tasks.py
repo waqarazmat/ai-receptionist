@@ -93,6 +93,37 @@ async def send_unsupported_message_reply(ctx: dict, org_id: str, contact_phone: 
     await send_text_message(uuid.UUID(org_id), contact_phone, text)
 
 
+async def process_whatsapp_voice_message(
+    ctx: dict,
+    org_id: str,
+    contact_phone: str,
+    contact_name: str | None,
+    media_id: str,
+    message_wamid: str,
+) -> None:
+    """Arq task for inbound WhatsApp voice notes (type=audio / type=voice).
+
+    Deduplicates on the Meta message id (same key scheme as text messages),
+    then delegates to voice_handler.handle_voice_note which owns the full
+    STT → RAG → TTS → send pipeline.
+    """
+    claimed = await redis_client.set(
+        _processed_message_key(message_wamid), "1", nx=True, ex=PROCESSED_MESSAGE_KEY_TTL_SECONDS
+    )
+    if not claimed:
+        logger.info("whatsapp_voice_already_processed", wamid=message_wamid)
+        return
+
+    from app.channels.whatsapp.voice_handler import handle_voice_note
+    await handle_voice_note(
+        org_id=uuid.UUID(org_id),
+        contact_phone=contact_phone,
+        contact_name=contact_name,
+        media_id=media_id,
+        wamid=message_wamid,
+    )
+
+
 async def process_whatsapp_status_update(ctx: dict, wamid: str, status_value: str) -> None:
     """Arq task enqueued by the webhook handler for each delivery/read/failed
     status callback."""

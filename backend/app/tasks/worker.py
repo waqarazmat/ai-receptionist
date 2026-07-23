@@ -9,6 +9,7 @@ from app.tasks.reminder_tasks import send_appointment_reminders
 from app.tasks.whatsapp_tasks import (
     process_whatsapp_message,
     process_whatsapp_status_update,
+    process_whatsapp_voice_message,
     send_unsupported_message_reply,
 )
 
@@ -27,7 +28,7 @@ class WorkerSettings:
     redis_settings = get_redis_settings()
     on_startup = startup
     # On-demand jobs, enqueued via app.tasks.queue.get_arq_pool().enqueue_job(...)
-    functions = [process_whatsapp_message, process_whatsapp_status_update, send_unsupported_message_reply]
+    functions = [process_whatsapp_message, process_whatsapp_status_update, process_whatsapp_voice_message, send_unsupported_message_reply]
     cron_jobs = [
         cron(send_appointment_reminders, minute={0, 15, 30, 45}),
         cron(check_google_calendar_health, minute=5),  # hourly, at :05

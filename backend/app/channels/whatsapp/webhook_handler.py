@@ -16,7 +16,7 @@ logger = structlog.get_logger()
 
 router = APIRouter()
 
-UNSUPPORTED_MESSAGE_TYPE_REPLY = "Sorry, I can only read text messages right now — could you type that out for me?"
+UNSUPPORTED_MESSAGE_TYPE_REPLY = "Sorry, I can only handle text and voice messages right now — could you type that out for me?"
 
 
 @router.get("/whatsapp")
@@ -103,11 +103,12 @@ async def receive_webhook(request: Request) -> Response:
                         continue
                     contact_name = contacts_by_wa_id.get(from_number, {}).get("profile", {}).get("name")
 
-                    # c. Parse message — text handled now; other types (image,
-                    # audio, ...) get a graceful static reply rather than
-                    # being silently dropped or fed into the AI pipeline as
-                    # if they were customer text.
-                    if message.get("type") == "text":
+                    # c. Route by message type:
+                    #    text  → existing RAG/text pipeline
+                    #    audio → new voice-note pipeline (STT → RAG → TTS)
+                    #    other → graceful static reply
+                    msg_type = message.get("type")
+                    if msg_type == "text":
                         message_text = message.get("text", {}).get("body", "").strip()
                         if not message_text:
                             continue
@@ -117,6 +118,38 @@ async def receive_webhook(request: Request) -> Response:
                             from_number,
                             contact_name,
                             message_text,
+                            message.get("id"),
+                        )
+                    elif msg_type == "audio":
+                        # Voice notes come as type="audio" with an "audio.id" media_id.
+                        # We also handle type="voice" which some older clients send.
+                        media_id = message.get("audio", {}).get("id")
+                        if not media_id:
+                            logger.warning(
+                                "whatsapp_audio_no_media_id",
+                                org_id=str(org_id),
+                                message_id=message.get("id"),
+                            )
+                            continue
+                        await pool.enqueue_job(
+                            "process_whatsapp_voice_message",
+                            str(org_id),
+                            from_number,
+                            contact_name,
+                            media_id,
+                            message.get("id"),
+                        )
+                    elif msg_type == "voice":
+                        # Some clients send voice notes as type="voice" instead of "audio".
+                        media_id = message.get("voice", {}).get("id")
+                        if not media_id:
+                            continue
+                        await pool.enqueue_job(
+                            "process_whatsapp_voice_message",
+                            str(org_id),
+                            from_number,
+                            contact_name,
+                            media_id,
                             message.get("id"),
                         )
                     else:

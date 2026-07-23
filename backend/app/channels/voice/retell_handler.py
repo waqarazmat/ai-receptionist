@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import re
 import time
 import uuid
 
@@ -33,6 +34,45 @@ from app.security.webhook_verify import verify_retell_signature
 from app.services.conversation_service import STATIC_RATE_LIMIT_MESSAGE, add_message, get_conversation_messages
 
 logger = structlog.get_logger()
+
+# Patterns for extracting the caller's name from voice transcripts.
+#
+# Strategy 1 — user-turn self-introduction phrases (most reliable):
+#   "my name is John", "I'm John", "this is John", "it's John", "call me John"
+_USER_NAME_RE = re.compile(
+    r"(?:my name(?:'?s| is)|i(?:'?m| am)(?: called)?|call me|this is|it'?s)\s+([a-zA-Z]{2,20}(?:\s+[a-zA-Z]{2,20})?)",
+    re.IGNORECASE,
+)
+# Strategy 2 — AI address patterns in the LLM response (very reliable: the AI
+# already identified the name and used it).  Includes every common phrase the
+# receptionist LLM is likely to use when it first addresses the caller by name.
+# The trailing group is optional-or-word-boundary so "Thank you, John" at the
+# end of a string still matches (no required trailing char).
+_AI_ADDRESS_RE = re.compile(
+    r"(?:"
+    r"thank(?:s| you)[,!]?|"
+    r"you'?re welcome[,!]?|"       # "You're welcome, John" — seen in real calls
+    r"hello[,!]?|hi[,!]?|hey[,!]?|"
+    r"sure[,!]?|great[,!]?|perfect[,!]?|wonderful[,!]?|"
+    r"of course[,!]?|absolutely[,!]?|certainly[,!]?|"
+    r"got it[,!]?|noted[,!]?|"
+    r"nice to (?:meet|hear from) you[,!]?"
+    r")\s+([A-Z][a-z]{1,19}(?:\s+[A-Z][a-z]{1,19})?)(?=[\s!.,?]|$)",
+)
+# Strategy 3 — AI asked "what is your name?" and the user's NEXT turn is
+# short (1-3 words).  Used only when strategies 1 and 2 find nothing.
+_AI_ASKS_NAME_RE = re.compile(
+    r"(?:your name|get your name|may i have your name|what(?:'?s| is) your name|"
+    r"who am i (?:speaking|talking) (?:with|to)|who is this)",
+    re.IGNORECASE,
+)
+# Words that are common false positives for self-intro patterns ("I'm fine").
+_NAME_STOPWORDS = frozenset(
+    {"fine", "good", "okay", "ok", "here", "there", "not", "in", "out", "on", "at",
+     "available", "interested", "calling", "looking", "trying", "just", "also",
+     "sorry", "sure", "ready", "back", "home", "done", "free", "actually",
+     "calling", "checking", "wondering", "hoping", "thinking"}
+)
 
 # Split in two: the call-lifecycle webhook is a genuine one-way signed
 # webhook (mounted under /api/public/webhooks/retell, alongside WhatsApp's),
@@ -143,6 +183,10 @@ class _CallState:
         # loaded — no extra DB round-trip on the critical path.
         self.org_name: str | None = None
         self.org_prompts: dict = {}
+        # Set from the call_details event the moment Retell sends it. Used by
+        # _ensure_conversation in _handle_turn so turns don't race and create
+        # a contact with name/phone="unknown" if call_details hasn't committed yet.
+        self.from_number: str | None = None
         # Contact is fixed for the whole call — resolved from the conversation
         # on first turn under contact_lock, cached thereafter.
         self.contact_name: str | None = None
@@ -411,6 +455,102 @@ async def receive_retell_webhook(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Contact-name extraction helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_name_from_transcript(transcript: list[dict], ai_response: str) -> str | None:
+    """Try to find the caller's real name from the transcript or the AI's response.
+
+    Three strategies, in order of reliability:
+    1. User self-introduction in any turn ("my name is John", "I'm John", …)
+    2. AI addresses the caller by name in the current response ("You're welcome, John")
+    3. Previous AI turn asked for the caller's name AND the user's reply is 1-3 words
+    Returns a title-cased name string, or None if nothing was found.
+    """
+    # Strategy 1 — user self-introduction phrases
+    for turn in reversed(transcript):
+        if turn.get("role") != "user":
+            continue
+        m = _USER_NAME_RE.search(turn.get("content") or "")
+        if m:
+            candidate = m.group(1).strip().title()
+            if candidate.lower() not in _NAME_STOPWORDS:
+                return candidate
+
+    # Strategy 2 — AI addresses caller by name in the current response
+    m = _AI_ADDRESS_RE.search(ai_response)
+    if m:
+        return m.group(1).strip()
+
+    # Strategy 3 — previous AI turn asked "what's your name?" and the
+    # immediately following user turn is a short reply (likely just the name).
+    for i, turn in enumerate(transcript):
+        if turn.get("role") not in ("agent", "assistant"):
+            continue
+        if not _AI_ASKS_NAME_RE.search(turn.get("content") or ""):
+            continue
+        # Look for the next user turn after this agent turn
+        for j in range(i + 1, len(transcript)):
+            next_turn = transcript[j]
+            if next_turn.get("role") != "user":
+                continue
+            words = (next_turn.get("content") or "").strip().split()
+            if 1 <= len(words) <= 3:
+                candidate = " ".join(w.title() for w in words)
+                if candidate.lower() not in _NAME_STOPWORDS:
+                    return candidate
+            break  # only check the immediately following user turn
+
+    return None
+
+
+async def _maybe_update_contact_name(
+    state: _CallState,
+    conversation_id: uuid.UUID,
+    transcript: list[dict],
+    ai_response: str,
+) -> None:
+    """Best-effort: if the contact is still recorded as 'unknown' or as their
+    raw phone number, extract a real name from the transcript and persist it.
+
+    Also updates the in-memory state cache so the system prompt on the next
+    turn of this same call shows the correct name immediately.
+    """
+    # Skip if we already have a real name (not phone number, not "unknown").
+    current = state.contact_name
+    phone = state.from_number
+    if current and current != "unknown" and current != phone:
+        return
+
+    name = _extract_name_from_transcript(transcript, ai_response)
+    if not name:
+        return
+
+    try:
+        async with async_session_maker() as db:
+            conv = await db.get(Conversation, conversation_id)
+            if conv and conv.contact_id:
+                contact = await db.get(Contact, conv.contact_id)
+                if contact and (
+                    contact.name in (None, "unknown")
+                    or contact.name == (phone or "")
+                ):
+                    contact.name = name
+                    await db.commit()
+                    # Update the state cache so subsequent turns on this call
+                    # see the correct name without a DB re-fetch.
+                    state.contact_name = name
+                    logger.info(
+                        "voice_contact_name_updated",
+                        conversation_id=str(conversation_id),
+                        name=name,
+                    )
+    except Exception:  # noqa: BLE001 — name update is best-effort, never fail a turn
+        logger.warning("voice_contact_name_update_failed", conversation_id=str(conversation_id))
+
+
+# ---------------------------------------------------------------------------
 # Custom LLM WebSocket — the live per-call conversation loop.
 # ---------------------------------------------------------------------------
 
@@ -514,7 +654,7 @@ async def _handle_turn(
         filler=filler.strip(),
     )
 
-    conversation_id = await _ensure_conversation(state, org_id, call_id, "unknown")
+    conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
 
     # Rate limit + rate-limited fallback path run on their own short-lived
     # session — they're pure Redis + a tiny DB write, no reason to hold a
@@ -700,6 +840,13 @@ async def _handle_turn(
         latency_ms=round((time.monotonic() - persist_customer_wait_start) * 1000),
     )
 
+    # Best-effort: if the contact is still named "unknown" or their phone number,
+    # try to extract a real name from the transcript. Runs as a fire-and-forget
+    # task so it never adds latency to the turn.
+    asyncio.create_task(
+        _maybe_update_contact_name(state, conversation_id, transcript, full_text)
+    )
+
     logger.info(
         "voice_turn_complete",
         org_id=str(org_id),
@@ -806,6 +953,9 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
                     await websocket.close(code=WS_CLOSE_AGENT_MISMATCH)
                     return
                 from_number = call.get("from_number") or "unknown"
+                # Cache on state immediately so _handle_turn's _ensure_conversation
+                # uses the real number even if _run_call_details hasn't committed yet.
+                state.from_number = from_number
                 logger.info("voice_ws_call_started", org_id=str(org_id), call_id=call_id, from_number=from_number)
                 # DB work off the loop (on_call_start can be slow on a remote DB).
                 spawn(_run_call_details(org_id, call_id, from_number, greeting, state))

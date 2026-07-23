@@ -81,5 +81,60 @@ class Settings(BaseSettings):
     OTP_ABUSE_LOCK_THRESHOLD: int = 3
     OTP_ABUSE_LOCK_SECONDS: int = 3600
 
+    # ── WhatsApp Voice Note pipeline (STT + TTS) ───────────────────────────
+    # These are platform-level keys, distinct from per-org LLM keys stored in
+    # org_api_keys. STT/TTS are billed to the platform, not individual orgs.
+
+    # "groq" (default, faster + cheaper) or "openai"
+    STT_PROVIDER: str = "groq"
+    # "openai" (default) or "deepgram"
+    TTS_PROVIDER: str = "openai"
+
+    # Groq API key — required when STT_PROVIDER=groq
+    GROQ_API_KEY: str | None = None
+
+    # Platform-level OpenAI key — used for STT (gpt-4o-mini-transcribe) when
+    # STT_PROVIDER=openai, and for TTS (tts-1) when TTS_PROVIDER=openai.
+    # Separate from per-org keys in org_api_keys (those drive the RAG/LLM pipeline).
+    OPENAI_API_KEY: str | None = None
+
+    # Deepgram API key — required when TTS_PROVIDER=deepgram
+    DEEPGRAM_API_KEY: str | None = None
+
+    # Voice notes larger than this (MB) are rejected before download.
+    MAX_VOICE_NOTE_FILE_SIZE_MB: float = 16.0
+    # Voice notes longer than this (seconds) are rejected after download.
+    MAX_VOICE_NOTE_DURATION_SECONDS: int = 120
+
+    # Directory for per-request audio scratch files. Cleaned up after every job.
+    TEMP_AUDIO_DIR: str = "/tmp/voice_notes"
+
+    # Replies longer than this are sent as text instead of TTS audio — long
+    # voice notes are bad UX and cost more per character on TTS providers.
+    MAX_VOICE_REPLY_CHARS: int = 500
+
+    # ISO 639-1 codes the pipeline accepts. Languages outside this list get a
+    # text reply instead of audio. Set to ["*"] to disable the check.
+    VOICE_SUPPORTED_LANGUAGES: list[str] = ["en", "fr", "nl", "de"]
+
+    # Which languages each TTS provider can actually speak.
+    # Consulted at runtime to decide whether to fall back to the multilingual
+    # provider when the default one can't handle the detected language.
+    # Adding a new language later is a config change only — no code change.
+    TTS_PROVIDER_LANGUAGE_SUPPORT: dict[str, list[str]] = {
+        "openai": ["en", "fr", "nl", "de", "es", "it", "pt", "pl", "ru", "zh", "ja", "ko", "ar", "hi", "tr"],
+        # Deepgram Aura-2 only has English voices as of 2025-07.
+        "deepgram": ["en"],
+    }
+
+    # When TTS_PROVIDER can't handle the detected language, automatically
+    # retry with this provider instead of falling back to a text reply.
+    TTS_MULTILINGUAL_FALLBACK_PROVIDER: str = "openai"
+
+    # Max voice notes a single WhatsApp number may send per minute.
+    # Guards against accidental loops or deliberate abuse (each note costs
+    # you STT + LLM + TTS money).
+    VOICE_NOTE_RATE_LIMIT_PER_MINUTE: int = 5
+
 
 settings = Settings()
