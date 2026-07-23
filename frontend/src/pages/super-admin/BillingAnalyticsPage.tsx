@@ -39,12 +39,10 @@ const WINDOWS = [
   { days: 90, label: "90d" },
 ] as const;
 
-// Provider brand-adjacent colors — mirror the main dashboard's palette so
-// the two pages feel like one family.
 const PROVIDER_COLORS: Record<string, string> = {
-  anthropic: "#d97706", // amber-600 — Anthropic's brand orange
-  openai: "#059669", // emerald-600 — OpenAI's mark green
-  cohere: "#7c3aed", // violet-600 — Cohere's mark purple
+  anthropic: "#d97706",
+  openai: "#059669",
+  cohere: "#7c3aed",
 };
 const CHANNEL_COLORS: Record<string, string> = {
   webchat: "#6366f1",
@@ -126,7 +124,7 @@ function ChartTooltip({
 
 export default function BillingAnalyticsPage() {
   const [windowDays, setWindowDays] = useState<number>(30);
-  const [orgFilter, setOrgFilter] = useState<string>("all"); // "all" or an org id
+  const [orgFilter, setOrgFilter] = useState<string>("all");
 
   const { data: orgs } = useOrganizations();
   const orgIdParam = orgFilter === "all" ? null : orgFilter;
@@ -139,6 +137,15 @@ export default function BillingAnalyticsPage() {
     if (orgFilter === "all") return "All organizations";
     return orgs?.find((o) => o.id === orgFilter)?.name ?? "Unknown organization";
   }, [orgFilter, orgs]);
+
+  // Guard: any missing top-level field falls through to "Failed to load."
+  const dataReady =
+    !!data &&
+    !!data.totals &&
+    Array.isArray(data.by_provider) &&
+    Array.isArray(data.by_channel) &&
+    Array.isArray(data.daily) &&
+    Array.isArray(data.per_org);
 
   return (
     <div>
@@ -156,7 +163,6 @@ export default function BillingAnalyticsPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {/* Org selector */}
           <div className="relative">
             <select
               value={orgFilter}
@@ -173,7 +179,6 @@ export default function BillingAnalyticsPage() {
             <Building2 className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
           </div>
 
-          {/* Window toggle */}
           <div className="inline-flex rounded-lg border border-slate-200 bg-white p-0.5 dark:border-slate-700 dark:bg-slate-800">
             {WINDOWS.map((w) => {
               const isActive = w.days === windowDays;
@@ -221,7 +226,7 @@ export default function BillingAnalyticsPage() {
             <Skeleton key={i} className="h-28 w-full rounded-xl" />
           ))}
         </div>
-      ) : isError || !data ? (
+      ) : isError || !dataReady ? (
         <p className="mt-6 text-sm text-rose-600 dark:text-rose-400">
           Failed to load billing analytics.
         </p>
@@ -237,16 +242,16 @@ export default function BillingAnalyticsPage() {
             <motion.div variants={itemFadeLeft}>
               <StatsCard
                 label={`Total spend · ${windowDays}d`}
-                value={`~$${data.kpis.total_usd.toFixed(2)}`}
+                value={`~$${(data.totals.total_usd ?? 0).toFixed(2)}`}
                 tone="indigo"
                 icon={<DollarSign className="h-5 w-5" />}
-                hint={`$${data.kpis.cost_per_message_usd.toFixed(4)} per message`}
+                hint={`${(data.totals.messages ?? 0).toLocaleString()} AI messages`}
               />
             </motion.div>
             <motion.div variants={itemFadeLeft}>
               <StatsCard
                 label="AI messages"
-                value={data.kpis.total_ai_messages.toLocaleString()}
+                value={(data.totals.messages ?? 0).toLocaleString()}
                 tone="blue"
                 icon={<MessageSquare className="h-5 w-5" />}
                 hint="Billable AI replies"
@@ -254,17 +259,17 @@ export default function BillingAnalyticsPage() {
             </motion.div>
             <motion.div variants={itemFadeLeft}>
               <StatsCard
-                label="LLM tokens cost"
-                value={`~$${(data.kpis.llm_input_usd + data.kpis.llm_output_usd).toFixed(2)}`}
+                label="LLM cost"
+                value={`~$${(data.totals.llm_usd ?? 0).toFixed(2)}`}
                 tone="amber"
                 icon={<Activity className="h-5 w-5" />}
-                hint={`In: $${data.kpis.llm_input_usd.toFixed(2)} · Out: $${data.kpis.llm_output_usd.toFixed(2)}`}
+                hint="Tokens (input + output)"
               />
             </motion.div>
             <motion.div variants={itemFadeLeft}>
               <StatsCard
                 label="External APIs"
-                value={`~$${data.kpis.external_api_usd.toFixed(2)}`}
+                value={`~$${(data.totals.external_usd ?? 0).toFixed(2)}`}
                 tone="rose"
                 icon={<TrendingUp className="h-5 w-5" />}
                 hint="Retell, WhatsApp, etc."
@@ -286,12 +291,14 @@ export default function BillingAnalyticsPage() {
             >
               <div className="h-72 w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={data.cost_by_day}>
+                  <AreaChart data={data.daily}>
                     <defs>
-                      <linearGradient id="spend-gradient" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#6366f1" stopOpacity={0.4} />
-                        <stop offset="100%" stopColor="#6366f1" stopOpacity={0} />
-                      </linearGradient>
+                      {(["webchat", "whatsapp", "voice"] as const).map((ch) => (
+                        <linearGradient key={ch} id={`spend-${ch}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor={CHANNEL_COLORS[ch]} stopOpacity={0.5} />
+                          <stop offset="100%" stopColor={CHANNEL_COLORS[ch]} stopOpacity={0} />
+                        </linearGradient>
+                      ))}
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="currentColor" opacity={0.08} />
                     <XAxis
@@ -314,26 +321,34 @@ export default function BillingAnalyticsPage() {
                         <ChartTooltip
                           labelFormatter={formatDayShort}
                           valuePrefix="~$"
-                          nameFormatter={() => "Spend"}
+                          nameFormatter={(k) => CHANNEL_LABELS[k] ?? k}
                         />
                       }
                       cursor={{ stroke: "currentColor", strokeOpacity: 0.15 }}
                     />
-                    <Area
-                      type="monotone"
-                      dataKey="total_usd"
-                      stroke="#6366f1"
-                      strokeWidth={2}
-                      fill="url(#spend-gradient)"
-                      animationDuration={600}
+                    <Legend
+                      wrapperStyle={{ fontSize: 12, paddingTop: 8 }}
+                      formatter={(v) => CHANNEL_LABELS[v as string] ?? v}
                     />
+                    {(["webchat", "whatsapp", "voice"] as const).map((ch) => (
+                      <Area
+                        key={ch}
+                        type="monotone"
+                        dataKey={ch}
+                        stackId="1"
+                        stroke={CHANNEL_COLORS[ch]}
+                        strokeWidth={2}
+                        fill={`url(#spend-${ch})`}
+                        animationDuration={600}
+                      />
+                    ))}
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
             </Card>
 
             <Card title="By provider">
-              {data.cost_by_provider.length === 0 ? (
+              {data.by_provider.length === 0 ? (
                 <EmptyState
                   icon={<Activity className="h-5 w-5" />}
                   title="No usage yet"
@@ -344,10 +359,10 @@ export default function BillingAnalyticsPage() {
                   <ResponsiveContainer width="100%" height="100%">
                     <PieChart>
                       <Pie
-                        data={data.cost_by_provider.map((p) => ({
-                          name: PROVIDER_LABELS[p.provider] ?? p.provider,
-                          providerKey: p.provider,
-                          value: p.total_usd,
+                        data={data.by_provider.map((p) => ({
+                          name: PROVIDER_LABELS[p?.provider] ?? p?.provider ?? "Unknown",
+                          providerKey: p?.provider,
+                          value: p?.total_usd ?? 0,
                         }))}
                         innerRadius="55%"
                         outerRadius="85%"
@@ -356,7 +371,7 @@ export default function BillingAnalyticsPage() {
                         nameKey="name"
                         animationDuration={600}
                       >
-                        {data.cost_by_provider.map((p) => (
+                        {data.by_provider.map((p) => (
                           <Cell
                             key={p.provider}
                             fill={PROVIDER_COLORS[p.provider] ?? "#94a3b8"}
@@ -373,15 +388,16 @@ export default function BillingAnalyticsPage() {
             </Card>
           </div>
 
-          {/* CHANNEL BREAKDOWN */}
+          {/* By channel */}
           <Card title="By channel" className="mt-6">
             <div className="h-64 w-full">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
-                  data={data.cost_by_channel.map((c) => ({
-                    name: CHANNEL_LABELS[c.channel] ?? c.channel,
-                    channelKey: c.channel,
-                    value: c.total_usd,
+                  data={data.by_channel.map((c) => ({
+                    name: CHANNEL_LABELS[c?.channel] ?? c?.channel ?? "Unknown",
+                    channelKey: c?.channel,
+                    value: c?.total_usd ?? 0,
+                    messages: c?.messages ?? 0,
                   }))}
                   layout="vertical"
                 >
@@ -406,7 +422,7 @@ export default function BillingAnalyticsPage() {
                     cursor={{ fill: "currentColor", fillOpacity: 0.05 }}
                   />
                   <Bar dataKey="value" radius={[0, 6, 6, 0]} animationDuration={600}>
-                    {data.cost_by_channel.map((c) => (
+                    {data.by_channel.map((c) => (
                       <Cell key={c.channel} fill={CHANNEL_COLORS[c.channel] ?? "#94a3b8"} />
                     ))}
                   </Bar>
@@ -415,7 +431,7 @@ export default function BillingAnalyticsPage() {
             </div>
           </Card>
 
-          {/* PER-ORG TABLE — only useful when viewing all orgs */}
+          {/* Per-org table */}
           {orgFilter === "all" && (
             <Card title="Per-organization breakdown" className="mt-6">
               {data.per_org.length === 0 ? (
@@ -432,8 +448,7 @@ export default function BillingAnalyticsPage() {
                         <th className="pb-3 pr-4">Plan</th>
                         <th className="pb-3 pr-4">Provider</th>
                         <th className="pb-3 pr-4 text-right">AI messages</th>
-                        <th className="pb-3 pr-4 text-right">LLM in</th>
-                        <th className="pb-3 pr-4 text-right">LLM out</th>
+                        <th className="pb-3 pr-4 text-right">LLM</th>
                         <th className="pb-3 pr-4 text-right">External</th>
                         <th className="pb-3 text-right">Total</th>
                       </tr>
@@ -458,27 +473,24 @@ export default function BillingAnalyticsPage() {
                             <span
                               className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold"
                               style={{
-                                backgroundColor: `${PROVIDER_COLORS[row.provider] ?? "#94a3b8"}20`,
-                                color: PROVIDER_COLORS[row.provider] ?? "#64748b",
+                                backgroundColor: `${PROVIDER_COLORS[row.primary_provider] ?? "#94a3b8"}20`,
+                                color: PROVIDER_COLORS[row.primary_provider] ?? "#64748b",
                               }}
                             >
-                              {PROVIDER_LABELS[row.provider] ?? row.provider}
+                              {PROVIDER_LABELS[row.primary_provider] ?? row.primary_provider}
                             </span>
                           </td>
                           <td className="py-3 pr-4 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                            {row.ai_messages.toLocaleString()}
+                            {(row.messages ?? 0).toLocaleString()}
                           </td>
                           <td className="py-3 pr-4 text-right font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                            ~${row.llm_input_usd.toFixed(2)}
+                            ~${(row.llm_usd ?? 0).toFixed(2)}
                           </td>
                           <td className="py-3 pr-4 text-right font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                            ~${row.llm_output_usd.toFixed(2)}
-                          </td>
-                          <td className="py-3 pr-4 text-right font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                            ~${row.external_api_usd.toFixed(2)}
+                            ~${(row.external_usd ?? 0).toFixed(2)}
                           </td>
                           <td className="py-3 text-right font-mono font-semibold tabular-nums text-slate-900 dark:text-slate-100">
-                            ~${row.total_usd.toFixed(2)}
+                            ~${(row.total_usd ?? 0).toFixed(2)}
                           </td>
                         </tr>
                       ))}

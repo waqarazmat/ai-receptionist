@@ -26,6 +26,24 @@ const CHANNEL_LABELS: Record<string, string> = {
 export default function BillingPage() {
   const { data, isLoading, isError } = useOrgBilling();
 
+  const dataReady =
+    !!data &&
+    !!data.plan &&
+    !!data.usage &&
+    !!data.current_month_costs &&
+    Array.isArray(data.by_channel);
+
+  // Pick the first mapped provider→model from pricing_notes as the "active" model
+  // display. The deployed billing endpoint doesn't return a `provider` field on
+  // its own — it exposes a full provider_model_map instead.
+  const providerModelMap = data?.pricing_notes?.provider_model_map ?? {};
+  const activeProvider = Object.keys(providerModelMap)[0] ?? "";
+  const activeModel = providerModelMap[activeProvider] ?? "—";
+  const modelInputPrice =
+    data?.pricing_notes?.model_input_price_per_1k?.[activeModel] ?? 0;
+  const modelOutputPrice =
+    data?.pricing_notes?.model_output_price_per_1k?.[activeModel] ?? 0;
+
   return (
     <div>
       <div className="flex items-center gap-2">
@@ -43,7 +61,7 @@ export default function BillingPage() {
           <Skeleton className="h-40 rounded-xl lg:col-span-2" />
           <Skeleton className="h-40 rounded-xl" />
         </div>
-      ) : isError || !data ? (
+      ) : isError || !dataReady ? (
         <p className="mt-6 text-sm text-rose-600 dark:text-rose-400">Failed to load billing.</p>
       ) : (
         <>
@@ -103,8 +121,8 @@ export default function BillingPage() {
                       Usage this month
                     </span>
                     <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                      {data.usage.messages_used.toLocaleString()} /{" "}
-                      {data.usage.messages_quota.toLocaleString()}
+                      {(data.usage.messages_this_month ?? 0).toLocaleString()} /{" "}
+                      {(data.usage.quota ?? 0).toLocaleString()}
                     </span>
                   </div>
                   <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
@@ -116,13 +134,13 @@ export default function BillingPage() {
                           ? "bg-amber-500"
                           : "bg-indigo-500"
                       }`}
-                      style={{ width: `${Math.min(data.usage.percent_used, 100)}%` }}
+                      style={{ width: `${Math.min(data.usage.percent_used ?? 0, 100)}%` }}
                     />
                   </div>
                   <p className="mt-1.5 text-xs text-slate-500 dark:text-slate-400">
-                    {data.usage.percent_used.toFixed(1)}% used ·{" "}
+                    {(data.usage.percent_used ?? 0).toFixed(1)}% used ·{" "}
                     {Math.max(
-                      data.usage.messages_quota - data.usage.messages_used,
+                      (data.usage.quota ?? 0) - (data.usage.messages_this_month ?? 0),
                       0,
                     ).toLocaleString()}{" "}
                     remaining
@@ -135,7 +153,7 @@ export default function BillingPage() {
                     What's included
                   </p>
                   <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                    {data.plan.features.map((f) => (
+                    {(data.plan.features ?? []).map((f) => (
                       <li key={f} className="flex items-start gap-2 text-sm text-slate-700 dark:text-slate-300">
                         <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
                         <span>{f}</span>
@@ -150,18 +168,22 @@ export default function BillingPage() {
             <motion.div variants={itemFadeLeft}>
               <StatsCard
                 label="Estimated cost this month"
-                value={`~$${data.cost_this_month.total_usd.toFixed(2)}`}
+                value={`~$${(data.current_month_costs.total_usd ?? 0).toFixed(2)}`}
                 tone="indigo"
                 icon={<DollarSign className="h-5 w-5" />}
-                hint={`${data.usage.ai_messages_this_month.toLocaleString()} AI messages`}
+                hint={`${(data.current_month_costs.messages ?? 0).toLocaleString()} AI messages`}
               />
               <div className="mt-6">
                 <StatsCard
                   label="Active LLM provider"
-                  value={data.provider.model}
+                  value={activeModel}
                   tone="amber"
                   icon={<Sparkles className="h-5 w-5" />}
-                  hint={`$${data.provider.llm_input_price_per_1k.toFixed(4)} in / $${data.provider.llm_output_price_per_1k.toFixed(4)} out per 1K tokens`}
+                  hint={
+                    activeProvider
+                      ? `${activeProvider} · $${modelInputPrice.toFixed(4)} in / $${modelOutputPrice.toFixed(4)} out per 1K tokens`
+                      : "No provider configured"
+                  }
                 />
               </div>
             </motion.div>
@@ -180,18 +202,10 @@ export default function BillingPage() {
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   <tr>
                     <td className="py-3 text-slate-700 dark:text-slate-300">
-                      LLM input tokens ({data.provider.model})
+                      LLM tokens {activeModel ? `(${activeModel})` : ""}
                     </td>
                     <td className="py-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                      ~${data.cost_this_month.llm_input_usd.toFixed(2)}
-                    </td>
-                  </tr>
-                  <tr>
-                    <td className="py-3 text-slate-700 dark:text-slate-300">
-                      LLM output tokens
-                    </td>
-                    <td className="py-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                      ~${data.cost_this_month.llm_output_usd.toFixed(2)}
+                      ~${(data.current_month_costs.llm_usd ?? 0).toFixed(2)}
                     </td>
                   </tr>
                   <tr>
@@ -199,7 +213,7 @@ export default function BillingPage() {
                       External APIs (Retell, WhatsApp, etc.)
                     </td>
                     <td className="py-3 text-right font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                      ~${data.cost_this_month.external_api_usd.toFixed(2)}
+                      ~${(data.current_month_costs.external_usd ?? 0).toFixed(2)}
                     </td>
                   </tr>
                   <tr className="bg-slate-50/50 dark:bg-slate-800/30">
@@ -207,7 +221,7 @@ export default function BillingPage() {
                       Total this month
                     </td>
                     <td className="py-3 text-right font-mono text-base font-bold tabular-nums text-slate-900 dark:text-slate-100">
-                      ~${data.cost_this_month.total_usd.toFixed(2)}
+                      ~${(data.current_month_costs.total_usd ?? 0).toFixed(2)}
                     </td>
                   </tr>
                 </tbody>
@@ -216,10 +230,10 @@ export default function BillingPage() {
           </Card>
 
           {/* By channel */}
-          {data.cost_this_month.by_channel.length > 0 && (
+          {data.by_channel.length > 0 && (
             <Card title="By channel" className="mt-6">
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                {data.cost_this_month.by_channel.map((c) => (
+                {data.by_channel.map((c) => (
                   <div
                     key={c.channel}
                     className="rounded-lg border border-slate-200 p-4 dark:border-slate-700"
@@ -231,10 +245,10 @@ export default function BillingPage() {
                       <MessageSquare className="h-4 w-4 text-slate-400" />
                     </div>
                     <p className="mt-2 text-2xl font-bold tabular-nums text-slate-900 dark:text-slate-100">
-                      ~${c.total_usd.toFixed(2)}
+                      ~${(c.total_usd ?? 0).toFixed(2)}
                     </p>
                     <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                      {c.ai_messages.toLocaleString()} AI messages
+                      {(c.messages ?? 0).toLocaleString()} AI messages
                     </p>
                   </div>
                 ))}
