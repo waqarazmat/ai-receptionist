@@ -101,7 +101,7 @@ async def get_user(db: AsyncSession, user_id: uuid.UUID) -> dict:
 async def invite_user(db: AsyncSession, data: UserInviteInput) -> dict:
     """Creates the user row so their first OTP-request succeeds. We do NOT
     send an invite email from here — the moment they hit request-otp with
-    this email, auth_service issues the code via Brevo. Frontend explains
+    this email, auth_service issues the code via SMTP. Frontend explains
     that flow to the admin."""
     existing = (
         await db.execute(select(User.id).where(func.lower(User.email) == data.email.lower()))

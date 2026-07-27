@@ -59,3 +59,19 @@ class BillingPlan(str, enum.Enum):
     starter = "starter"
     pro = "pro"
     enterprise = "enterprise"
+
+
+class BusinessVertical(str, enum.Enum):
+    """Industry vertical used to select per-category AI guardrails and default
+    retention windows. Populated from the setup-wizard "Load template" choice
+    and never overrides org-specific custom_system_prompt — it's additive."""
+    general = "general"
+    medical = "medical"
+    dental = "dental"
+    veterinary = "veterinary"
+    legal = "legal"
+    gym = "gym"
+    salon = "salon"
+    spa = "spa"
+    real_estate = "real_estate"
+    other = "other"

@@ -88,15 +88,17 @@ export default function SetupWizardPage() {
         </Button>
       </div>
 
-      <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[240px_1fr]">
-        <WizardStepper
-          steps={WIZARD_STEPS}
-          currentStep={currentStep}
-          completedSteps={completedSteps}
-          onStepClick={setStep}
-        />
+      <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[260px_1fr] items-start">
+        <div className="lg:sticky lg:top-6">
+          <WizardStepper
+            steps={WIZARD_STEPS}
+            currentStep={currentStep}
+            completedSteps={completedSteps}
+            onStepClick={setStep}
+          />
+        </div>
 
-        <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-sm">
+        <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-sm min-h-120">
           <StepComponent
             orgId={orgId}
             setupState={setupState}

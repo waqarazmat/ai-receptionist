@@ -1,18 +1,24 @@
 import re
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm_router import PROVIDER_PRIORITY
 from app.channels.voice import retell_provisioner
 from app.config import settings
+from app.models.appointment import Appointment
 from app.models.channel_config import ChannelConfig
+from app.models.contact import Contact
+from app.models.conversation import Conversation
 from app.models.enums import ApiKeyProvider, Channel
 from app.models.escalation import Escalation
+from app.models.knowledge_base import KnowledgeBase
+from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.message import Message
 from app.models.org_api_keys import OrgApiKey
 from app.models.organization import Organization
+from app.models.user import User
 from app.schemas.organization import (
     OrgChannelStatusResponse,
     OrganizationCreate,
@@ -84,12 +90,26 @@ def _stats_select():
     )
 
 
+_REGULATED_VERTICALS = {"medical", "dental", "veterinary", "legal"}
+
+
 async def create_organization(db: AsyncSession, data: OrganizationCreate) -> Organization:
+    # Regulated verticals get a shorter default retention window so new orgs
+    # don't accidentally store sensitive data longer than necessary. Still
+    # overridable per-org via data_retention_days.
+    retention: int | None = None
+    if data.business_vertical.value in _REGULATED_VERTICALS:
+        retention = settings.REGULATED_VERTICAL_RETENTION_DAYS
+
     org = Organization(
         name=data.name,
         slug=await _unique_slug(db, data.name),
         industry=data.industry,
         timezone=data.timezone,
+        business_vertical=data.business_vertical,
+        data_retention_days=retention,
+        country=data.country,
+        supported_languages=data.supported_languages,
     )
     db.add(org)
     await db.commit()
@@ -198,6 +218,46 @@ async def delete_organization(db: AsyncSession, org_id: uuid.UUID) -> Organizati
     await db.commit()
     await db.refresh(org)
     return org
+
+
+async def erase_organization(db: AsyncSession, org_id: uuid.UUID) -> None:
+    """Irreversibly delete ALL data for an org — GDPR Article 17 hard-erase.
+
+    Cascade order respects FK constraints (children before parents).
+    KnowledgeChunk rows include the pgvector embedding column — deleting the
+    row removes the vector; there is no separate vector-store to clean up.
+
+    The audit log entry must be committed by the caller BEFORE invoking this
+    function so the record of the erasure survives even if the delete rolls back.
+    """
+    # 1. Escalations reference conversations and orgs
+    await db.execute(delete(Escalation).where(Escalation.org_id == org_id))
+    # 2. Appointments reference conversations, contacts, and orgs
+    await db.execute(delete(Appointment).where(Appointment.org_id == org_id))
+    # 3. Messages reference conversations and orgs
+    await db.execute(delete(Message).where(Message.org_id == org_id))
+    # 4. Conversations reference contacts and orgs
+    await db.execute(delete(Conversation).where(Conversation.org_id == org_id))
+    # 5. Contacts reference orgs
+    await db.execute(delete(Contact).where(Contact.org_id == org_id))
+    # 6. KnowledgeChunks (vectors) reference knowledge_bases and orgs
+    await db.execute(delete(KnowledgeChunk).where(KnowledgeChunk.org_id == org_id))
+    # 7. KnowledgeBases reference orgs
+    await db.execute(delete(KnowledgeBase).where(KnowledgeBase.org_id == org_id))
+    # 8. ChannelConfigs reference orgs
+    await db.execute(delete(ChannelConfig).where(ChannelConfig.org_id == org_id))
+    # 9. OrgApiKeys reference orgs
+    await db.execute(delete(OrgApiKey).where(OrgApiKey.org_id == org_id))
+    # 10. Org staff users — deactivate rather than delete so their user record
+    # isn't a dangling FK target in audit_log rows (audit_log is never erased).
+    await db.execute(
+        User.__table__.update()
+        .where(User.org_id == org_id)
+        .values(is_active=False, org_id=None)
+    )
+    # 11. Organization itself
+    await db.execute(delete(Organization).where(Organization.id == org_id))
+    await db.commit()
 
 
 async def activate_organization(db: AsyncSession, org_id: uuid.UUID) -> Organization:

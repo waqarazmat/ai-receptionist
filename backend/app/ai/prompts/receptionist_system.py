@@ -1,3 +1,20 @@
+from app.ai.prompts.health_adjacent_guardrail import HEALTH_ADJACENT_GUARDRAIL
+from app.ai.prompts.legal_guardrail import LEGAL_GUARDRAIL
+from app.ai.prompts.medical_guardrail import MEDICAL_GUARDRAIL
+
+# Maps business_vertical value → guardrail text to inject.
+# Verticals not listed here get no guardrail (general / real_estate / other).
+_VERTICAL_GUARDRAILS: dict[str, str] = {
+    "medical":    MEDICAL_GUARDRAIL,
+    "dental":     MEDICAL_GUARDRAIL,
+    "veterinary": MEDICAL_GUARDRAIL,
+    "legal":      LEGAL_GUARDRAIL,
+    "gym":        HEALTH_ADJACENT_GUARDRAIL,
+    "salon":      HEALTH_ADJACENT_GUARDRAIL,
+    "spa":        HEALTH_ADJACENT_GUARDRAIL,
+}
+
+
 def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
     """Build the full system prompt from an org's saved config.
 
@@ -73,11 +90,19 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
             "a person would say them (e.g. \"nine AM\", not \"9:00 AM\")."
         )
 
+    # Per-vertical guardrail — injected BEFORE the org's custom_system_prompt
+    # so org-authored text still wins on conflicts, but the safety restriction
+    # is always present and cannot be omitted by leaving custom_system_prompt blank.
+    vertical = org_config.get("business_vertical") or "general"
+    guardrail = _VERTICAL_GUARDRAILS.get(str(vertical).lower())
+    if guardrail:
+        lines += ["", guardrail]
+
     if custom_system_prompt:
-        # Injected verbatim so orgs can add brand-voice rules, industry
-        # guardrails, or override the generic guidelines above. Placed AFTER
-        # the guidelines so it wins on conflicts (later instructions in a
-        # system prompt take precedence in practice for Claude/GPT/Cohere).
+        # Injected verbatim so orgs can add brand-voice rules or overrides.
+        # Placed AFTER the guardrail so it wins on tone/style but cannot
+        # override the safety restriction above (the LLM sees the guardrail
+        # earlier and the instruction not to diagnose is unambiguous).
         lines += ["", "Additional instructions from the business:", custom_system_prompt]
 
     if knowledge_context:

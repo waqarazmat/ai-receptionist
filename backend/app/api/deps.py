@@ -1,6 +1,7 @@
 import uuid
 from collections.abc import AsyncGenerator
 
+import structlog
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +31,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
     if user is None or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    # Bind org_id (and user_id) to structlog context so every log line emitted
+    # during this request automatically carries them — no need for each handler
+    # to pass org_id manually. Cleared at request end by RequestIDMiddleware.
+    structlog.contextvars.bind_contextvars(
+        user_id=str(user.id),
+        org_id=str(user.org_id) if user.org_id else "super_admin",
+    )
 
     return user
 

@@ -22,8 +22,30 @@ class Settings(BaseSettings):
 
     MASTER_ENCRYPTION_KEY: str
 
-    BREVO_API_KEY: str
-    OTP_FROM_EMAIL: str
+    # ── Transactional email — primary SMTP relay ──────────────────────────────
+    # Point these at any standard SMTP relay — Amazon SES, Mailgun, Postmark,
+    # Resend, etc. — by setting env vars. No code change required to switch
+    # providers, only credentials.
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str | None = None
+    SMTP_PASSWORD: str | None = None
+    SMTP_FROM_ADDRESS: str | None = None
+    SMTP_FROM_NAME: str = "AI Receptionist"
+    # True = STARTTLS (port 587, most relays). False = no STARTTLS upgrade
+    # (use port 465 with implicit TLS configured at the relay, or port 25 in dev).
+    SMTP_USE_TLS: bool = True
+
+    # ── Transactional email — fallback SMTP relay ─────────────────────────────
+    # Optional. When set, EmailService will attempt delivery through this relay
+    # after the primary exhausts all retries or fails on auth. Unset = failover
+    # disabled (current behaviour unchanged). Use a *different* provider from
+    # the primary so a single vendor outage doesn't take out both paths.
+    SMTP_HOST_FALLBACK: str | None = None
+    SMTP_PORT_FALLBACK: int = 587
+    SMTP_USERNAME_FALLBACK: str | None = None
+    SMTP_PASSWORD_FALLBACK: str | None = None
+    SMTP_FROM_ADDRESS_FALLBACK: str | None = None
 
     SUPER_ADMIN_EMAIL: str
 
@@ -62,6 +84,14 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
+    # Alerting webhook — optional. Paste a Slack or Discord incoming webhook
+    # URL here. When set, critical background task failures (e.g. email
+    # delivery exhausting all retries) POST a short message to this URL in
+    # addition to the existing structlog ERROR. Both Slack and Discord accept
+    # the same {"text": "..."} payload for incoming webhooks, so one field
+    # covers both. Leave blank to keep log-only behavior.
+    ALERT_WEBHOOK_URL: str | None = None
+
     # Sentry error tracking — optional. When set, unhandled exceptions and
     # explicit logger.error() calls stream to Sentry with request context.
     # Leave blank in dev; set on Railway once a project exists in Sentry.
@@ -80,6 +110,15 @@ class Settings(BaseSettings):
     # to trigger legitimate users' OTP quotas.
     OTP_ABUSE_LOCK_THRESHOLD: int = 3
     OTP_ABUSE_LOCK_SECONDS: int = 3600
+
+    # ── GDPR data retention ────────────────────────────────────────────────
+    # How long to keep conversation + message rows before pruning. Applies when
+    # an org has no per-tenant data_retention_days set. Medical/legal orgs are
+    # defaulted to a shorter window at creation time by org_service.
+    DEFAULT_CONVERSATION_RETENTION_DAYS: int = 365
+    # Shorter default for regulated verticals (medical, dental, legal).
+    # Applied automatically at org creation; can still be overridden per-org.
+    REGULATED_VERTICAL_RETENTION_DAYS: int = 90
 
     # ── WhatsApp Voice Note pipeline (STT + TTS) ───────────────────────────
     # These are platform-level keys, distinct from per-org LLM keys stored in

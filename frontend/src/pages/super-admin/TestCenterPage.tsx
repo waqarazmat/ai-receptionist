@@ -78,9 +78,19 @@ function WebChatTestCard({ orgId, configured }: { orgId: string; configured: boo
 <html>
   <head>
     <meta charset="utf-8" />
-    <style>body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f8fafc; }</style>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f1f5f9; min-height: 100vh; }
+      .page-hint { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; color: #94a3b8; user-select: none; pointer-events: none; }
+      .page-hint svg { margin: 0 auto 8px; opacity: 0.4; }
+      .page-hint p { font-size: 13px; margin: 0; }
+    </style>
   </head>
   <body>
+    <div class="page-hint">
+      <svg width="32" height="32" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+      <p>Click the chat bubble →</p>
+    </div>
     <script src="${window.location.origin}${LOCAL_CW_SCRIPT_PATH}" data-org-id="${orgId}" data-api-base="${import.meta.env.VITE_API_URL}"></script>
   </body>
 </html>`;
@@ -98,37 +108,56 @@ function WebChatTestCard({ orgId, configured }: { orgId: string; configured: boo
     <Card>
       <CardHeader icon={<MessageSquare className="h-5 w-5 text-indigo-600" />} title="Web Chat" configured={configured} />
 
-      <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">
-        This is the real widget on a blank page — click the chat bubble in the corner below, same as a visitor would.
-      </p>
-      <iframe
-        title="Web chat widget preview"
-        srcDoc={previewSrcDoc}
-        className="h-[500px] w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900"
-      />
+      {/* Live preview */}
+      <div className="rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700 shadow-sm">
+        {/* Preview chrome bar */}
+        <div className="flex items-center gap-2 px-3 py-2 bg-slate-100 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+          <span className="h-2.5 w-2.5 rounded-full bg-red-400" />
+          <span className="h-2.5 w-2.5 rounded-full bg-amber-400" />
+          <span className="h-2.5 w-2.5 rounded-full bg-emerald-400" />
+          <span className="ml-2 flex-1 rounded-md bg-white dark:bg-slate-700 px-3 py-1 text-[11px] text-slate-400 dark:text-slate-500 font-mono truncate">
+            yourwebsite.com
+          </span>
+        </div>
+        <iframe
+          title="Web chat widget preview"
+          srcDoc={previewSrcDoc}
+          className="h-175 w-full bg-slate-50 dark:bg-slate-900"
+          sandbox="allow-scripts allow-same-origin allow-forms"
+        />
+      </div>
 
-      <div className="mt-4">
-        <p className="mb-2 text-sm font-medium text-slate-700 dark:text-slate-200">Embed Code</p>
-        <pre className="overflow-x-auto rounded-lg bg-slate-900 p-3 text-xs text-slate-100">
+      <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
+        Click the chat bubble in the bottom-right corner — this is exactly what your client&apos;s visitors will see.
+      </p>
+
+      {/* Embed code */}
+      <div className="mt-5 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+          <span className="text-xs font-semibold uppercase tracking-widest text-slate-400 dark:text-slate-500">
+            Embed Code
+          </span>
+          <Button size="sm" variant="secondary" onClick={handleCopy}>
+            {copied ? (
+              <>
+                <Check className="h-3.5 w-3.5 text-emerald-500" />
+                Copied!
+              </>
+            ) : (
+              <>
+                <Copy className="h-3.5 w-3.5" />
+                Copy
+              </>
+            )}
+          </Button>
+        </div>
+        <pre className="overflow-x-auto bg-slate-900 dark:bg-slate-950 px-4 py-3 text-xs text-slate-200 leading-relaxed">
           <code>{embedCode}</code>
         </pre>
-        <Button size="sm" variant="secondary" className="mt-2" onClick={handleCopy}>
-          {copied ? (
-            <>
-              <Check className="h-4 w-4" />
-              Copied!
-            </>
-          ) : (
-            <>
-              <Copy className="h-4 w-4" />
-              Copy to Clipboard
-            </>
-          )}
-        </Button>
-        <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-          Paste this code into your client&apos;s website HTML, just before &lt;/body&gt;.
-        </p>
       </div>
+      <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
+        Paste this snippet into the client&apos;s website HTML just before <code className="font-mono">&lt;/body&gt;</code>.
+      </p>
     </Card>
   );
 }

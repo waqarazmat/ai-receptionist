@@ -1,18 +1,118 @@
-import httpx
+"""Transactional email via a configurable SMTP relay.
+
+Provider-agnostic by design: point SMTP_HOST/PORT/USERNAME/PASSWORD at any
+standard relay (Amazon SES, Mailgun, Postmark, Resend SMTP, etc.) through
+environment variables — no code change required to switch providers.
+
+Failover: if SMTP_HOST_FALLBACK (and SMTP_FROM_ADDRESS_FALLBACK) are set,
+EmailService will attempt the fallback provider once after the primary
+exhausts all retries or fails on auth.  Either provider can be swapped
+without touching this file.
+
+Public API used by the rest of the codebase:
+
+    from app.utils.email import send_otp_email, EmailDeliveryError
+
+    await send_otp_email(to_email, otp_code)   # raises EmailDeliveryError on failure
+
+For new email types, use the singleton directly:
+
+    from app.utils.email import email_service
+
+    await email_service.send_email(
+        to="user@example.com",
+        subject="Appointment confirmed",
+        html_body=email_service.render("appointment_confirmation.html", **ctx),
+        text_body="...",
+    )
+"""
+
+import asyncio
+from dataclasses import dataclass
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+
+import aiosmtplib
+import jinja2
 import structlog
 
 from app.config import settings
 
 logger = structlog.get_logger()
 
-BREVO_SEND_URL = "https://api.brevo.com/v3/smtp/email"
+_TEMPLATE_DIR = Path(__file__).parent.parent / "templates" / "email"
+_jinja_env = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(str(_TEMPLATE_DIR)),
+    autoescape=jinja2.select_autoescape(["html", "htm"]),
+)
 
+# Seconds to wait before attempt 2, then attempt 3.  Three total attempts is
+# enough to survive a transient relay hiccup without adding painful latency.
+_RETRY_DELAYS = (0.5, 1.5)
+
+
+# ── Provider descriptor ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class _SmtpProvider:
+    """All connection details for one SMTP relay, plus a human-readable label
+    used in log events so ops can immediately see which relay sent (or failed)
+    without decoding hostnames."""
+
+    host: str
+    port: int
+    username: str | None
+    password: str | None
+    from_address: str
+    from_name: str
+    use_tls: bool
+    label: str  # "primary" | "fallback"
+
+
+def _primary_provider() -> _SmtpProvider:
+    return _SmtpProvider(
+        host=settings.SMTP_HOST or "",
+        port=settings.SMTP_PORT,
+        username=settings.SMTP_USERNAME or None,
+        password=settings.SMTP_PASSWORD or None,
+        from_address=settings.SMTP_FROM_ADDRESS or "",
+        from_name=settings.SMTP_FROM_NAME,
+        use_tls=settings.SMTP_USE_TLS,
+        label="primary",
+    )
+
+
+def _fallback_provider() -> "_SmtpProvider | None":
+    """Returns the fallback provider descriptor, or None if not configured.
+
+    Both SMTP_HOST_FALLBACK and SMTP_FROM_ADDRESS_FALLBACK must be set —
+    a host without a sender address (or vice-versa) is unusable.
+    """
+    if not settings.SMTP_HOST_FALLBACK or not settings.SMTP_FROM_ADDRESS_FALLBACK:
+        return None
+    return _SmtpProvider(
+        host=settings.SMTP_HOST_FALLBACK,
+        port=settings.SMTP_PORT_FALLBACK,
+        username=settings.SMTP_USERNAME_FALLBACK or None,
+        password=settings.SMTP_PASSWORD_FALLBACK or None,
+        from_address=settings.SMTP_FROM_ADDRESS_FALLBACK,
+        from_name=settings.SMTP_FROM_NAME,  # keep the same display name
+        use_tls=settings.SMTP_USE_TLS,      # inherit TLS preference from primary
+        label="fallback",
+    )
+
+
+# ── Exceptions ────────────────────────────────────────────────────────────────
 
 class EmailDeliveryError(Exception):
-    """Raised when the transactional email API call fails. Wraps the underlying
-    httpx error and Brevo's response body (if any) so the caller can log the
-    real reason (bad api-key, unverified sender, quota exhausted, etc.)
-    without callers having to re-parse httpx internals."""
+    """Raised when the email cannot be delivered after all retry attempts
+    (and the fallback provider, if configured, also failed).
+
+    Carries the SMTP status code and response body (when available) so callers
+    can log the real reason (bad credentials, unverified sender, quota, etc.)
+    without needing to re-parse lower-level exceptions.
+    """
 
     def __init__(self, message: str, status_code: int | None = None, body: str | None = None):
         super().__init__(message)
@@ -20,73 +120,273 @@ class EmailDeliveryError(Exception):
         self.body = body
 
 
-async def send_otp_email(to_email: str, otp_code: str) -> None:
-    """Send an OTP code via the Brevo transactional email API.
+# ── Service ───────────────────────────────────────────────────────────────────
 
-    Raises EmailDeliveryError on any failure (network error OR Brevo returning
-    a non-2xx). Callers must decide how to degrade — do NOT let a Brevo error
-    silently swallow the user's OTP request; they'll never know their code
-    isn't coming.
+class EmailService:
+    """Async SMTP email sender backed by aiosmtplib.
+
+    Delivery strategy:
+    1. Try the primary provider up to 3 times (2 retries with backoff).
+    2. If the primary is exhausted or auth-fails, and a fallback provider is
+       configured, attempt the fallback once.
+    3. If the fallback also fails (or is not configured), raise EmailDeliveryError.
+
+    Every successful send logs which provider actually delivered the message
+    (provider="primary" or provider="fallback") so silent degradation to the
+    fallback is visible in structured logs.
     """
-    payload = {
-        "sender": {"email": settings.OTP_FROM_EMAIL, "name": "AI Receptionist"},
-        "to": [{"email": to_email}],
-        "subject": "Your verification code",
-        "htmlContent": (
-            f"<p>Your verification code is <strong>{otp_code}</strong>.</p>"
-            "<p>It expires in 10 minutes. If you didn't request this, "
-            "you can ignore this email.</p>"
-        ),
-        # Brevo requires either htmlContent or textContent; providing both
-        # gives clients that strip HTML (some corporate MTAs) a usable body.
-        "textContent": (
-            f"Your verification code is {otp_code}.\n\n"
-            "It expires in 10 minutes. If you didn't request this, you can "
-            "ignore this email."
-        ),
-    }
-    headers = {
-        "api-key": settings.BREVO_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(BREVO_SEND_URL, json=payload, headers=headers)
-    except httpx.HTTPError as exc:
-        # Network-level failure (DNS, TLS, timeout). No response to inspect.
-        logger.warning(
-            "brevo_send_network_error",
-            to_email=to_email,
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
-        raise EmailDeliveryError(f"Brevo network error: {exc}") from exc
 
-    if response.is_success:
-        # Brevo returns { "messageId": "..." } on success — record it so we
-        # can correlate a bounce or delivery event back to a request later.
-        message_id: str | None = None
+    # ── Template rendering ────────────────────────────────────────────────────
+
+    def render(self, template_name: str, **ctx: object) -> str:
+        """Render a Jinja2 template from app/templates/email/.
+
+        Raises EmailDeliveryError if the template file does not exist so the
+        failure surfaces clearly at the call site rather than as a silent
+        empty-body send.
+        """
         try:
-            message_id = response.json().get("messageId")
-        except Exception:  # noqa: BLE001 — non-JSON success body is unlikely but survivable
-            pass
-        logger.info("brevo_send_ok", to_email=to_email, message_id=message_id)
-        return
+            tmpl = _jinja_env.get_template(template_name)
+            return tmpl.render(**ctx)
+        except jinja2.TemplateNotFound as exc:
+            raise EmailDeliveryError(
+                f"Email template '{template_name}' not found in {_TEMPLATE_DIR}"
+            ) from exc
 
-    # Non-2xx. Brevo's error body carries the real reason (bad api-key,
-    # unverified sender, invalid recipient format, quota exhausted, etc.).
-    # Log the raw text so operators don't need to reverse-engineer failures
-    # from a status code alone.
-    body_text = response.text[:2000]
-    logger.warning(
-        "brevo_send_failed",
-        to_email=to_email,
-        status_code=response.status_code,
-        response_body=body_text,
+    # ── Message building ──────────────────────────────────────────────────────
+
+    def _build_message(
+        self,
+        to: str,
+        subject: str,
+        html_body: str,
+        text_body: str | None,
+        reply_to: str | None,
+        provider: _SmtpProvider,
+    ) -> MIMEMultipart:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = (
+            f"{provider.from_name} <{provider.from_address}>"
+            if provider.from_name
+            else provider.from_address
+        )
+        msg["To"] = to
+        if reply_to:
+            msg["Reply-To"] = reply_to
+
+        # Plain-text part first: email clients prefer the last matching part,
+        # so HTML must come second to win in clients that support both.
+        if text_body:
+            msg.attach(MIMEText(text_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        return msg
+
+    # ── Low-level send helpers ────────────────────────────────────────────────
+
+    async def _send_once(
+        self,
+        msg: MIMEMultipart,
+        provider: _SmtpProvider,
+        to: str,
+        subject: str,
+        attempt: int,
+    ) -> None:
+        """One SMTP send attempt.  Raises SMTPAuthenticationError (permanent)
+        or SMTPException/OSError/TimeoutError (transient) on failure — callers
+        decide whether to retry or escalate."""
+        await aiosmtplib.send(
+            msg,
+            hostname=provider.host,
+            port=provider.port,
+            username=provider.username,
+            password=provider.password,
+            start_tls=provider.use_tls,
+            timeout=15,
+        )
+        logger.info(
+            "email_sent",
+            to=to,
+            subject=subject,
+            provider=provider.label,
+            smtp_host=provider.host,
+            attempt=attempt,
+        )
+
+    async def _send_with_retries(
+        self,
+        msg: MIMEMultipart,
+        provider: _SmtpProvider,
+        to: str,
+        subject: str,
+    ) -> None:
+        """Try `provider` up to 3 times (2 retries) with backoff.
+
+        Raises EmailDeliveryError on auth failure (immediately, no retry) or
+        after all attempts are exhausted.
+        """
+        total_attempts = len(_RETRY_DELAYS) + 1
+        last_exc: BaseException | None = None
+
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+            try:
+                await self._send_once(msg, provider, to, subject, attempt)
+                return
+
+            except aiosmtplib.SMTPAuthenticationError as exc:
+                logger.error(
+                    "email_auth_failed",
+                    to=to,
+                    subject=subject,
+                    provider=provider.label,
+                    smtp_host=provider.host,
+                    error=str(exc),
+                )
+                raise EmailDeliveryError(
+                    f"SMTP auth failed on {provider.label} provider "
+                    f"({provider.host}) — check credentials: {exc}"
+                ) from exc
+
+            except (aiosmtplib.SMTPException, OSError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "email_send_attempt_failed",
+                    to=to,
+                    subject=subject,
+                    provider=provider.label,
+                    smtp_host=provider.host,
+                    attempt=attempt,
+                    total_attempts=total_attempts,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                if delay is not None:
+                    await asyncio.sleep(delay)
+
+        raise EmailDeliveryError(
+            f"{provider.label} SMTP provider ({provider.host}) failed after "
+            f"{total_attempts} attempts: {last_exc}"
+        ) from last_exc
+
+    # ── Public send API ───────────────────────────────────────────────────────
+
+    async def send_email(
+        self,
+        to: str,
+        subject: str,
+        html_body: str,
+        text_body: str | None = None,
+        reply_to: str | None = None,
+    ) -> None:
+        """Send an email, failing over to the secondary provider if the primary
+        is unavailable.
+
+        Delivery order:
+          1. Primary provider — up to 3 attempts with backoff.
+          2. Fallback provider (if SMTP_HOST_FALLBACK is set) — 1 attempt.
+          3. EmailDeliveryError if both fail (or fallback is not configured).
+
+        Logs 'provider=primary' or 'provider=fallback' on every successful
+        send so degradation to the fallback is visible in structured logs.
+
+        Raises:
+            EmailDeliveryError: when no provider succeeds.  Never raises raw
+                aiosmtplib / OS exceptions — always wraps them so callers have
+                a single exception type to catch.
+        """
+        primary = _primary_provider()
+        if not primary.host or not primary.from_address:
+            raise EmailDeliveryError(
+                "SMTP is not configured. Set SMTP_HOST and SMTP_FROM_ADDRESS "
+                "in your environment variables."
+            )
+
+        primary_msg = self._build_message(to, subject, html_body, text_body, reply_to, primary)
+
+        # ── Primary attempt ───────────────────────────────────────────────────
+        primary_exc: EmailDeliveryError | None = None
+        try:
+            await self._send_with_retries(primary_msg, primary, to, subject)
+            return
+        except EmailDeliveryError as exc:
+            primary_exc = exc
+
+        # ── Fallback attempt ──────────────────────────────────────────────────
+        fallback = _fallback_provider()
+        if fallback is None:
+            raise primary_exc
+
+        logger.warning(
+            "email_falling_back_to_secondary",
+            to=to,
+            subject=subject,
+            primary_host=primary.host,
+            fallback_host=fallback.host,
+            primary_error=str(primary_exc),
+        )
+
+        # Rebuild message with the fallback From address — some relays reject
+        # messages whose From header doesn't match the authenticated sender.
+        fallback_msg = self._build_message(to, subject, html_body, text_body, reply_to, fallback)
+
+        try:
+            # Single attempt on the fallback — it's a last resort, not a full
+            # retry cycle, to keep total latency bounded.
+            await self._send_once(fallback_msg, fallback, to, subject, attempt=1)
+        except aiosmtplib.SMTPAuthenticationError as exc:
+            fallback_err = EmailDeliveryError(
+                f"SMTP auth failed on fallback provider ({fallback.host}): {exc}"
+            )
+            logger.error(
+                "email_fallback_auth_failed",
+                to=to,
+                subject=subject,
+                fallback_host=fallback.host,
+                error=str(exc),
+            )
+            raise EmailDeliveryError(
+                f"Both SMTP providers failed. Primary: {primary_exc}. Fallback auth error: {exc}"
+            ) from fallback_err
+        except (aiosmtplib.SMTPException, OSError, asyncio.TimeoutError) as exc:
+            logger.error(
+                "email_both_providers_failed",
+                to=to,
+                subject=subject,
+                primary_host=primary.host,
+                fallback_host=fallback.host,
+                primary_error=str(primary_exc),
+                fallback_error=str(exc),
+            )
+            raise EmailDeliveryError(
+                f"Both SMTP providers failed. Primary: {primary_exc}. Fallback: {exc}"
+            ) from exc
+
+
+# ── Module-level singleton ────────────────────────────────────────────────────
+
+email_service = EmailService()
+
+
+# ── High-level helpers (keep call signatures stable) ─────────────────────────
+
+async def send_otp_email(to_email: str, otp_code: str) -> None:
+    """Send a one-time password email to `to_email`.
+
+    Renders the otp.html Jinja2 template and delivers it via the configured
+    SMTP relay (with automatic fallover to the secondary provider if configured).
+    Raises EmailDeliveryError on any failure — callers must decide how to
+    surface this to the user; do NOT swallow the error silently or the
+    recipient will never know their code isn't coming.
+    """
+    html_body = email_service.render("otp.html", otp_code=otp_code)
+    text_body = (
+        f"Your verification code is {otp_code}.\n\n"
+        "It expires in 10 minutes. If you didn't request this, "
+        "you can safely ignore this email."
     )
-    raise EmailDeliveryError(
-        f"Brevo returned {response.status_code}",
-        status_code=response.status_code,
-        body=body_text,
+    await email_service.send_email(
+        to=to_email,
+        subject="Your verification code",
+        html_body=html_body,
+        text_body=text_body,
     )

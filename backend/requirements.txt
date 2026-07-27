@@ -21,6 +21,8 @@ anthropic
 openai
 cohere
 httpx
+aiosmtplib
+jinja2
 beautifulsoup4
 firecrawl-py
 google-api-python-client

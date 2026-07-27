@@ -3,11 +3,16 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
+from app.models.enums import BusinessVertical
+
 
 class OrganizationCreate(BaseModel):
     name: str
     industry: str
     timezone: str
+    business_vertical: BusinessVertical = BusinessVertical.general
+    country: str | None = None
+    supported_languages: list[str] = ["en"]
 
 
 class OrganizationUpdate(BaseModel):
@@ -19,6 +24,16 @@ class OrganizationUpdate(BaseModel):
     email: str | None = None
     is_active: bool | None = None
     is_trial: bool | None = None
+    business_vertical: BusinessVertical | None = None
+    data_retention_days: int | None = None
+    country: str | None = None
+    supported_languages: list[str] | None = None
+
+
+class OrgEraseRequest(BaseModel):
+    """Caller must supply the org's exact name as a confirmation step.
+    Prevents accidental hard-erasure from a mis-clicked button."""
+    confirm_name: str
 
 
 class ChannelsEnabled(BaseModel):
@@ -44,6 +59,10 @@ class OrganizationResponse(BaseModel):
     setup_completed: bool
     message_count: int
     escalation_count: int
+    business_vertical: BusinessVertical
+    data_retention_days: int | None
+    country: str | None
+    supported_languages: list[str]
     created_at: datetime
 
 

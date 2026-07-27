@@ -37,18 +37,27 @@ class TestWhatsappSignature:
         assert verify_whatsapp_signature(payload, signature, "wrong-secret") is False
 
 
+def _retell_sign(api_key: str, payload: bytes) -> str:
+    """Build a Retell-format signature: `v={timestamp_ms},d={hex_digest}`.
+    The digest covers raw_body + timestamp (no separator), matching the
+    implementation in webhook_verify.verify_retell_signature."""
+    timestamp = str(int(time.time() * 1000))
+    digest = hmac.new(api_key.encode(), payload + timestamp.encode(), hashlib.sha256).hexdigest()
+    return f"v={timestamp},d={digest}"
+
+
 class TestRetellSignature:
     def test_valid_signature_passes(self):
         api_key = "retell-key"
         payload = b'{"transcript": "hello"}'
-        signature = _sign(api_key, payload)
+        signature = _retell_sign(api_key, payload)
 
         assert verify_retell_signature(payload, signature, api_key) is True
 
     def test_tampered_payload_fails(self):
         api_key = "retell-key"
         payload = b'{"transcript": "hello"}'
-        signature = _sign(api_key, payload)
+        signature = _retell_sign(api_key, payload)
 
         tampered_payload = b'{"transcript": "goodbye"}'
 

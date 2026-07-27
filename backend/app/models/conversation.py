@@ -32,3 +32,8 @@ class Conversation(Base):
     # WebSocket both find their way back to the same conversation row.
     retell_call_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True, unique=True)
     call_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Set to the timestamp when the AI-identity disclosure was first delivered
+    # on this conversation (AI Act Art. 50). NULL = not yet sent. Checked
+    # before every outbound message so the disclosure fires exactly once.
+    ai_disclosure_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

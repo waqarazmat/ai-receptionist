@@ -377,6 +377,22 @@ export const STYLES = /* css */ `
   padding: 2px 0; align-self: center;
 }
 
+/* AI Act Art. 50 disclosure — welcome screen inline notice */
+.ai-notice {
+  font-size: 11.5px; color: var(--ctl);
+  background: #f0f9ff; border: 1px solid rgba(0,153,255,0.18);
+  border-radius: 8px; padding: 6px 10px;
+  text-align: center; margin: 4px 0;
+  line-height: 1.45;
+}
+
+/* AI Act Art. 50 disclosure — persistent strip at top of chat body */
+.ai-notice-strip {
+  font-size: 11px; color: var(--ctl);
+  background: #f0f9ff; border-bottom: 1px solid rgba(0,153,255,0.15);
+  padding: 5px 12px; text-align: center; flex-shrink: 0;
+}
+
 /* Consent banner */
 .consent-banner {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;

@@ -30,6 +30,14 @@ const LANGS = [
   { code: "fr", label: "FR" },
 ];
 
+// AI Act Article 50 — must be shown before any interaction. Not configurable
+// by the org: it is a legal requirement, not a branding choice.
+const AI_DISCLOSURE: Record<string, string> = {
+  nl: "U spreekt met een AI-assistent.",
+  en: "You are chatting with an AI assistant.",
+  fr: "Vous discutez avec un assistant IA.",
+};
+
 export function ChatWindow({
   config, phase, lang, messages, isTyping,
   inputValue, isSending, consentAccepted,
@@ -152,6 +160,10 @@ export function ChatWindow({
             </svg>
           </div>
           <h2 class="welcome-title">{greeting}</h2>
+          {/* AI Act Art. 50 disclosure — must appear BEFORE any user interaction */}
+          <p class="ai-notice">
+            🤖 {AI_DISCLOSURE[lang] ?? AI_DISCLOSURE["en"]}
+          </p>
           <p class="welcome-sub">
             {config.responseTimeText ?? "Choose your language to get started."}
           </p>
@@ -172,6 +184,12 @@ export function ChatWindow({
 
       {/* Chat body */}
       <div class={`chat-body${phase === "chat" ? " active" : ""}`}>
+        {/* AI Act Art. 50 — persistent disclosure strip in chat phase */}
+        {phase === "chat" && (
+          <div class="ai-notice-strip">
+            🤖 {AI_DISCLOSURE[lang] ?? AI_DISCLOSURE["en"]}
+          </div>
+        )}
         <div class="messages">
           {/* Suggested questions before first user message */}
           {messages.length === 0 && suggestedQuestions.length > 0 && (

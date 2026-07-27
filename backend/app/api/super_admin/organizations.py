@@ -8,6 +8,7 @@ from app.channels.voice import retell_provisioner
 from app.models.user import User
 from app.schemas.organization import (
     OrgChannelStatusResponse,
+    OrgEraseRequest,
     OrganizationCreate,
     OrganizationListResponse,
     OrganizationResponse,
@@ -204,3 +205,45 @@ async def delete_organization(
         ip_address=request.client.host if request.client else None,
     )
     return org
+
+
+@router.delete("/organizations/{org_id}/erase", status_code=status.HTTP_204_NO_CONTENT)
+async def erase_organization(
+    org_id: uuid.UUID,
+    body: OrgEraseRequest,
+    request: Request,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_admin_db_session),
+) -> None:
+    """Irreversible GDPR Article 17 hard-erase. Deletes ALL data for this org
+    including conversation history, messages, knowledge chunks (and their
+    pgvector embeddings), contacts, and API keys.
+
+    Requires the org's exact name in the request body as a confirmation guard.
+    The erasure is recorded in the audit log (which is never erased) before
+    any data is deleted, so the compliance record survives even if the caller
+    disputes the action later.
+    """
+    try:
+        org = await org_service.get_organization(db, org_id)
+    except org_service.OrganizationNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    if body.confirm_name != org.name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"confirm_name '{body.confirm_name}' does not match organization name '{org.name}'.",
+        )
+
+    # Commit audit entry FIRST — must survive even if the delete fails.
+    await log_action(
+        db,
+        user_id=current_user.id,
+        action="org.hard_erase",
+        target_type="organization",
+        target_id=org_id,
+        details={"org_name": org.name, "org_slug": org.slug},
+        ip_address=request.client.host if request.client else None,
+    )
+
+    await org_service.erase_organization(db, org_id)

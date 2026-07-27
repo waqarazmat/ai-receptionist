@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 import structlog
 from sqlalchemy import select
@@ -19,6 +20,13 @@ logger = structlog.get_logger()
 # per-message id so a retry can't create a second customer message / fire a
 # second LLM call / send a second reply.
 PROCESSED_MESSAGE_KEY_TTL_SECONDS = 60 * 60 * 24
+
+# AI Act Article 50 — sent as the very first message in every new WhatsApp
+# conversation. Not translatable via org config; it's a legal requirement.
+_AI_DISCLOSURE_WA = (
+    "🤖 This conversation is handled by an AI assistant. "
+    "A staff member can take over at any time if needed."
+)
 
 
 def _processed_message_key(wamid: str) -> str:
@@ -41,6 +49,7 @@ async def process_whatsapp_message(
 
     org_uuid = uuid.UUID(org_id)
 
+    # ── Phase 1: get or create contact + conversation, mark disclosure ───────
     async with async_session_maker() as db:
         contact = await contact_service.get_or_create_contact_by_phone(
             db, org_uuid, contact_phone, Channel.whatsapp, contact_name
@@ -49,7 +58,25 @@ async def process_whatsapp_message(
             db, org_uuid, contact.id, Channel.whatsapp
         )
         conversation_id = conversation.id
+        is_new_conversation = conversation.ai_disclosure_sent_at is None
+        if is_new_conversation:
+            # Mark first so a concurrent retry can't send a second disclosure.
+            conversation.ai_disclosure_sent_at = datetime.now(timezone.utc)
+            await db.commit()
 
+    # ── Phase 2: send AI disclosure as the first WhatsApp message ───────────
+    # Sent BEFORE the AI reply so it arrives first in the customer's thread.
+    if is_new_conversation:
+        await send_text_message(org_uuid, contact_phone, _AI_DISCLOSURE_WA)
+        logger.info(
+            "ai_disclosure_sent",
+            org_id=org_id,
+            channel="whatsapp",
+            conversation_id=str(conversation_id),
+        )
+
+    # ── Phase 3: run AI pipeline ─────────────────────────────────────────────
+    async with async_session_maker() as db:
         response_text = await conversation_service.process_customer_message(
             db, org_uuid, conversation_id, message_text
         )

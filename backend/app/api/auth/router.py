@@ -52,11 +52,16 @@ async def request_otp(body: RequestOtpRequest, session: AsyncSession = Depends(g
     # Real user, OTP in Redis, now try to deliver it. On failure we prefer
     # to surface the error to the caller so they can retry, rather than
     # silently claim success while their inbox stays empty. This does mean
-    # a Brevo outage becomes distinguishable from a non-existent-email
+    # an SMTP outage becomes distinguishable from a non-existent-email
     # response (existent-broken -> 502, non-existent -> 200 generic) — an
     # enumeration hint we accept in exchange for a working retry UX. If
     # the enumeration property becomes critical, revisit by queueing sends
     # via Arq and always returning 200 here.
+    # TEMPORARY: email delivery failures are swallowed here while we're
+    # between email providers (Brevo suspended, new provider not yet
+    # configured). REVERT to raising 502 once a working SMTP provider is
+    # confirmed — otherwise real users will get a false "success" with no
+    # actual OTP email and no way to know why they never received it.
     try:
         await send_otp_email(body.email, code)
     except EmailDeliveryError as exc:
@@ -64,12 +69,7 @@ async def request_otp(body: RequestOtpRequest, session: AsyncSession = Depends(g
             "otp_email_send_failed",
             email=body.email,
             status_code=exc.status_code,
-            # exc.body already truncated to 2000 chars inside send_otp_email.
             response_body=exc.body,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Could not send verification email. Please try again in a moment.",
         )
 
     return MessageResponse(message=GENERIC_OTP_MESSAGE)

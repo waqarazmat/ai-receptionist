@@ -28,6 +28,25 @@ STRIP_TAGS = ["script", "style", "nav", "footer", "header", "aside"]
 HEADING_RE = re.compile(r"^(#{1,3})\s+(.*)$", re.MULTILINE)
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
+# ── PII heuristics ────────────────────────────────────────────────────────────
+# CSS class/id patterns that strongly indicate testimonial or team-bio blocks.
+# Not exhaustive — intended as a best-effort guard, not a legal guarantee.
+_TESTIMONIAL_CLASSES = re.compile(
+    r"\b(testimonial|review|quote|rating|feedback|client[-_]?say|"
+    r"what[-_]?(?:our|they|clients?)[-_]?say|star[-_]?rating)\b",
+    re.IGNORECASE,
+)
+_TEAM_CLASSES = re.compile(
+    r"\b(team[-_]?member|staff[-_]?(?:member|card|profile)?|"
+    r"our[-_]?team|meet[-_]?(?:the[-_]?)?team|bio|employee[-_]?card|"
+    r"doctor[-_]?card|dentist[-_]?card|attorney[-_]?card|lawyer[-_]?card)\b",
+    re.IGNORECASE,
+)
+# Attribution line like "— Jane Smith" or "- John D." at the end of a block
+_ATTRIBUTION_LINE_RE = re.compile(r"^\s*[-–—]\s*[A-Z][a-z]+(?:\s+[A-Z][a-z.]+)*\s*$", re.MULTILINE)
+# Star-rating markers (★★★★★ or 5/5 or "5 stars")
+_STAR_RATING_RE = re.compile(r"[★☆]{3,}|[1-5]\s*/\s*5\b|\b[1-5]\s+stars?\b", re.IGNORECASE)
+
 # Requires punctuation/spacing between groups (not bare digit runs) to avoid
 # false-positives on order numbers, zip+4 codes, etc. — real phone numbers on
 # websites are almost always written with some separator.
@@ -54,6 +73,51 @@ CRAWLER_HEADERS = {"User-Agent": "AIReceptionistBot/1.0 (+knowledge-base import)
 
 class CrawlError(Exception):
     pass
+
+
+def _strip_pii_blocks(soup: BeautifulSoup, page_url: str) -> int:
+    """Remove DOM elements that heuristically look like testimonial or team-bio
+    blocks. Operates in-place on `soup`. Returns the number of blocks removed
+    so callers can log the count for knowledge-base ingestion visibility.
+
+    Matches on CSS class/id attributes — fast and low false-positive rate since
+    developers use semantic names for these sections. Falls back to content
+    heuristics (star ratings, attribution lines) when class names aren't helpful.
+    """
+    removed = 0
+
+    for tag in soup.find_all(True):  # all elements
+        cls_str = " ".join(tag.get("class") or [])
+        id_str = tag.get("id") or ""
+        combined = f"{cls_str} {id_str}"
+
+        if _TESTIMONIAL_CLASSES.search(combined) or _TEAM_CLASSES.search(combined):
+            tag.decompose()
+            removed += 1
+            continue
+
+        # Content heuristic: a short block (<300 chars) that contains both a
+        # star rating AND an attribution line is almost certainly a testimonial.
+        text = tag.get_text(" ", strip=True)
+        if (
+            len(text) < 300
+            and _STAR_RATING_RE.search(text)
+            and _ATTRIBUTION_LINE_RE.search(text)
+        ):
+            tag.decompose()
+            removed += 1
+
+    if removed:
+        logger.info("crawler_pii_blocks_stripped", url=page_url, blocks_removed=removed)
+
+    return removed
+
+
+def _markdown_has_pii_markers(text: str) -> bool:
+    """Return True if a markdown chunk looks like a testimonial (star rating +
+    attribution line). Used to flag Firecrawl-sourced chunks that we can't
+    DOM-filter since Firecrawl already converted the HTML to markdown."""
+    return bool(_STAR_RATING_RE.search(text) and _ATTRIBUTION_LINE_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +446,7 @@ async def crawl_website_simple(url: str, max_pages: int = DEFAULT_MAX_PAGES) -> 
             soup = BeautifulSoup(response.text, "html.parser")
             for tag in soup.find_all(STRIP_TAGS):
                 tag.decompose()
+            _strip_pii_blocks(soup, current)
 
             title = soup.title.get_text(strip=True) if soup.title else current
             text = _extract_text(soup)
@@ -493,7 +558,22 @@ def chunk_pages(pages: list[dict]) -> list[dict]:
                 raw_chunks.append({"title": title, "content": piece, "source_url": page["url"]})
 
     long_enough = [c for c in raw_chunks if len(c["content"]) >= MIN_CHUNK_CHARS]
-    return _merge_short_chunks(long_enough)
+
+    # Drop chunks that look like testimonials in markdown (star rating +
+    # attribution line). Logs each skip so it's visible in ingestion output.
+    clean: list[dict] = []
+    for chunk in long_enough:
+        if _markdown_has_pii_markers(chunk["content"]):
+            logger.info(
+                "crawler_pii_chunk_skipped",
+                title=chunk.get("title"),
+                source_url=chunk.get("source_url"),
+                chars=len(chunk["content"]),
+            )
+        else:
+            clean.append(chunk)
+
+    return _merge_short_chunks(clean)
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ router = APIRouter()
 @router.get("/otp")
 async def peek_otp(email: str = Query(..., description="Email whose OTP to peek at.")) -> dict:
     """Return the current OTP for `email` from Redis. Used by the Playwright
-    e2e suite to bypass Brevo (Playwright can't read Gmail).
+    e2e suite to bypass SMTP delivery (Playwright can't read email inboxes).
 
     Belt-and-suspenders: even though the router itself is only mounted when
     APP_ENV=development, we also refuse to answer in production here. If

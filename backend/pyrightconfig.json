@@ -1,0 +1,15 @@
+{
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "exclude": ["alembic"],
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "reportUnusedParameter": "none"
+    },
+    {
+      "root": "app/tasks",
+      "reportUnusedParameter": "none"
+    }
+  ]
+}
