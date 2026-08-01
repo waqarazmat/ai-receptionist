@@ -8,6 +8,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.enums import ApiKeyProvider
 from app.models.org_api_keys import OrgApiKey
 from app.security.encryption import decrypt_api_key
@@ -121,6 +122,19 @@ async def get_org_llm_clients(
         sdk = _build_sdk(provider, api_key)
         clients.append(OrgLLMClient(provider=provider, model=models[provider], api_key=api_key, sdk=sdk))
 
+    if not clients:
+        # No org-level keys — fall back to the platform OpenAI key so voice
+        # test calls work for every org before their keys are configured.
+        if settings.OPENAI_API_KEY:
+            tier_models = QUALITY_MODELS if model_tier == "quality" else FAST_MODELS
+            sdk = _build_sdk(ApiKeyProvider.openai, settings.OPENAI_API_KEY)
+            clients.append(OrgLLMClient(
+                provider=ApiKeyProvider.openai,
+                model=tier_models[ApiKeyProvider.openai],
+                api_key=settings.OPENAI_API_KEY,
+                sdk=sdk,
+            ))
+            logger.info("llm_platform_key_fallback", org_id=str(org_id), provider="openai")
     if not clients:
         raise NoLLMProviderConfiguredError(f"No LLM provider configured for org {org_id}")
     return clients

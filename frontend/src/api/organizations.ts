@@ -68,6 +68,20 @@ export function useCreateVoiceAgent(orgId: string) {
   });
 }
 
+export interface WebCallToken {
+  access_token: string;
+  call_id: string;
+}
+
+export function useCreateWebCall(orgId: string) {
+  return useMutation({
+    mutationFn: () =>
+      apiClient
+        .post<WebCallToken>(`/api/admin/organizations/${orgId}/voice/web-call`, {})
+        .then((r) => r.data),
+  });
+}
+
 export function useCreateOrganization() {
   const queryClient = useQueryClient();
   return useMutation({

@@ -89,6 +89,16 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
             "keep replies to one or two short sentences; speak numbers, times, and prices as "
             "a person would say them (e.g. \"nine AM\", not \"9:00 AM\")."
         )
+        lines.append(
+            "- Call termination: when the caller explicitly asks to hang up or end the call "
+            "(\"hang up\", \"end the call\", \"that's all\", \"goodbye\" etc.), give ONE brief "
+            "polite farewell (e.g. \"Goodbye, have a great day!\") and then append the exact "
+            "text [END_CALL] on a new line — this signals the system to disconnect. "
+            "Also append [END_CALL] after a natural conversation conclusion: when you have fully "
+            "resolved the caller's inquiry (answered their question, confirmed a booking) and "
+            "exchanged a farewell, add [END_CALL] at the end of your goodbye response. "
+            "Do NOT generate a second goodbye or keep the conversation open after [END_CALL]."
+        )
 
     # Per-vertical guardrail — injected BEFORE the org's custom_system_prompt
     # so org-authored text still wins on conflicts, but the safety restriction

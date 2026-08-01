@@ -1,10 +1,12 @@
 import uuid
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_admin_db_session, require_super_admin
 from app.channels.voice import retell_provisioner
+from app.config import settings
 from app.models.user import User
 from app.schemas.organization import (
     OrgChannelStatusResponse,
@@ -157,6 +159,56 @@ async def create_voice_agent(
         "webhook_url": created["webhook_url"],
         "voice_id": retell_provisioner.DEFAULT_VOICE_ID,
     }
+
+
+@router.post("/organizations/{org_id}/voice/web-call")
+async def create_voice_web_call(
+    org_id: uuid.UUID,
+    db: AsyncSession = Depends(get_admin_db_session),
+    _: User = Depends(require_super_admin),
+) -> dict:
+    """Create a Retell web-call token for in-browser voice testing.
+
+    Returns an access_token the frontend passes to the retell-client-js-sdk
+    to start a browser call — no Retell dashboard login required, so any
+    super admin can test regardless of whose Retell account is configured.
+    """
+    if not settings.RETELL_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="RETELL_API_KEY is not configured on this platform.",
+        )
+
+    try:
+        channel_status = await org_service.get_channel_status(db, org_id)
+    except org_service.OrganizationNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    agent_id = channel_status.voice.retell_agent_id
+    if not agent_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No Retell agent configured for this organization.",
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.retellai.com/v2/create-web-call",
+                headers={"Authorization": f"Bearer {settings.RETELL_API_KEY}"},
+                json={"agent_id": agent_id},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not reach Retell API: {exc}")
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Retell API error ({resp.status_code}): {resp.text}",
+        )
+
+    data = resp.json()
+    return {"access_token": data["access_token"], "call_id": data["call_id"]}
 
 
 @router.put("/organizations/{org_id}", response_model=OrganizationResponse)

@@ -28,6 +28,7 @@ from app.models.conversation import Conversation
 from app.models.enums import ApiKeyProvider, Channel, MessageRole
 from app.models.org_api_keys import OrgApiKey
 from app.models.organization import Organization
+from app.config import settings
 from app.security.encryption import decrypt_api_key
 from app.security.rate_limiter import check_message_rate_limit, increment_message_count
 from app.security.webhook_verify import verify_retell_signature
@@ -91,6 +92,77 @@ VOICE_REMINDER_TEXT = "Are you still there? I'm happy to keep helping whenever y
 # answer, so Retell concatenates it into a single utterance (no double-speak).
 # Trailing space matters: TTS runs "Mm-hmm," and the streamed answer together.
 _FILLERS = ["Mm-hmm, ", "Let's see, ", "One moment, "]
+
+# ── End-call detection ────────────────────────────────────────────────────────
+#
+# Retell's Custom LLM protocol ends a call by including `"end_call": true` in
+# the final response frame.  We trigger this via two fast-path checks (before
+# the LLM is called) and one post-stream check (marker the LLM appends).
+
+# Caller explicitly signals they want to hang up right now.
+_HANGUP_RE = re.compile(
+    r"\b(?:"
+    r"hang\s*up|"
+    r"end\s+(?:the\s+)?call|"
+    r"cut\s+(?:the\s+|this\s+)?call|"
+    r"stop\s+(?:the\s+)?call|"
+    r"disconnect|"
+    r"i(?:'m|\s+am)\s+done|"
+    r"that(?:'s|\s+is)\s+all|"
+    r"no\s+(?:more|further)\s+questions?|"
+    r"gotta\s+go|got\s+to\s+go|need\s+to\s+go"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Short farewell acknowledgments — trigger end-call when the previous AI turn
+# already said goodbye (so the caller is just confirming, not starting over).
+_FAREWELL_ACK_WORDS: frozenset[str] = frozenset({
+    "ok", "okay", "sure", "alright", "right", "great", "perfect", "thanks",
+    "thank you", "cool", "bye", "bye bye", "goodbye", "see you", "cheers",
+    "sounds good", "that's all", "that is all", "wonderful", "excellent",
+    "got it", "understood",
+})
+
+# Goodbye language in a previous AI turn — paired with a farewell ack above
+# to detect the "double goodbye" pattern without calling the LLM again.
+_GOODBYE_RE = re.compile(
+    r"\b(?:"
+    r"goodbye|bye(?:\s*bye)?|"
+    r"have\s+a\s+(?:great|good|nice|wonderful|lovely)\s+(?:day|evening|night|weekend)|"
+    r"take\s+care|see\s+you\s+(?:soon|next|later)|"
+    r"thank(?:s|\s+you)\s+for\s+(?:calling|reaching\s+out)|"
+    r"don(?:'t)?\s+hesitate\s+to\s+(?:call|reach)|"
+    r"feel\s+free\s+to\s+(?:call|reach)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Token the LLM appends when it determines the conversation is naturally done.
+# Detected after streaming; stripped from the persisted transcript.
+_END_CALL_MARKER = "[END_CALL]"
+
+
+def _is_explicit_hangup(text: str) -> bool:
+    """True when the caller's message unambiguously asks to end the call now."""
+    return bool(_HANGUP_RE.search(text))
+
+
+def _is_post_goodbye_ack(message_text: str, transcript: list[dict]) -> bool:
+    """True when the last AI turn said goodbye and the caller's reply is a
+    short farewell acknowledgment with no new question.
+
+    Uses the live Retell transcript (already in memory) rather than a DB
+    history query, so it costs nothing extra on the critical path.
+    """
+    words = message_text.strip().lower().rstrip("!.,?").strip()
+    if words not in _FAREWELL_ACK_WORDS:
+        return False
+    for turn in reversed(transcript):
+        if turn.get("role") in ("assistant", "agent"):
+            return bool(_GOODBYE_RE.search(turn.get("content") or ""))
+    return False
+
 
 # ── Language-selection menu (multi-language orgs only) ────────────────────────
 #
@@ -250,6 +322,23 @@ class _Sender:
     async def send_shortcut(self, response_id: int | None, text: str) -> None:
         await self.send(
             {"response_type": "response", "response_id": response_id, "content": text, "content_complete": True}
+        )
+
+    async def send_end_call_shortcut(self, response_id: int | None, text: str) -> None:
+        """Send a complete response and signal Retell to terminate the call.
+
+        Retell's Custom LLM protocol ends a call by including `end_call: true`
+        in any response frame — no separate API call or agent-side function
+        registration needed for Custom LLM agents.
+        """
+        await self.send(
+            {
+                "response_type": "response",
+                "response_id": response_id,
+                "content": text,
+                "content_complete": True,
+                "end_call": True,
+            }
         )
 
     async def send_response_close(self, response_id: int | None) -> None:
@@ -513,9 +602,11 @@ async def _get_active_retell_key(org_id: uuid.UUID) -> str | None:
                 )
             )
         ).scalar_one_or_none()
-    if row is None:
-        return None
-    return decrypt_api_key(str(org_id), row.encrypted_key)
+    if row is not None:
+        return decrypt_api_key(str(org_id), row.encrypted_key)
+    # All agents run under a single Retell account — all webhooks are signed
+    # with the same platform key, so the org doesn't need its own key stored.
+    return settings.RETELL_API_KEY
 
 
 @webhook_router.post("/retell")
@@ -900,6 +991,46 @@ async def _handle_turn(
     if not message_text:
         return
 
+    # ── End-call fast paths ───────────────────────────────────────────────────
+    # Both checks use only data already in memory (the transcript Retell sent
+    # us), so they cost nothing extra on the critical path — no DB, no LLM.
+
+    # Path A: Caller explicitly asked to hang up ("end the call", "hang up"…).
+    # Skip the filler and LLM entirely — reply immediately with a brief
+    # goodbye and signal Retell to disconnect.
+    if _is_explicit_hangup(message_text):
+        goodbye = "Of course. Goodbye, and have a great day!"
+        await sender.send_end_call_shortcut(response_id, goodbye)
+        logger.info(
+            "call_ended_by_agent",
+            org_id=str(org_id),
+            call_id=call_id,
+            reason="explicit_request",
+        )
+        conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
+        async with async_session_maker() as db:
+            await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
+            await add_message(db, conversation_id, MessageRole.ai, goodbye, Channel.voice)
+        return
+
+    # Path B: "Double goodbye" — the AI already said goodbye in the previous
+    # turn, and the caller replied with a short acknowledgment ("okay", "bye",
+    # "thanks"…) rather than a new question.  End the call immediately instead
+    # of generating a second unprompted goodbye and waiting for more input.
+    if _is_post_goodbye_ack(message_text, transcript):
+        await sender.send_end_call_shortcut(response_id, "Goodbye!")
+        logger.info(
+            "call_ended_by_agent",
+            org_id=str(org_id),
+            call_id=call_id,
+            reason="natural_conclusion",
+        )
+        conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
+        async with async_session_maker() as db:
+            await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
+            await add_message(db, conversation_id, MessageRole.ai, "Goodbye!", Channel.voice)
+        return
+
     # Instant filler frame — nothing above this touches DB or LLM, so this
     # goes on the wire ~1-3ms into the turn. Sent with content_complete=False
     # under the real response_id so Retell keeps the utterance open and just
@@ -1069,9 +1200,39 @@ async def _handle_turn(
             collected.append(FALLBACK_MESSAGE)
             await sender.send_chunk(response_id, FALLBACK_MESSAGE, content_complete=False)
 
-    await sender.send_chunk(response_id, "", content_complete=True)
-
+    # ── End-call marker check (LLM-driven natural conclusion) ────────────────
+    # The system prompt instructs the LLM to append [END_CALL] when it decides
+    # the conversation is naturally complete (e.g. booking confirmed + goodbye
+    # exchanged).  We detect the marker after full collection, strip it from the
+    # persisted text, and include `end_call: true` in the close frame.
+    #
+    # The marker may have been streamed to Retell's TTS buffer already, but
+    # `end_call: true` on the close frame terminates the call before the audio
+    # is synthesised — so the caller never hears "[END CALL]".
     full_text = "".join(collected)
+    natural_end = full_text.rstrip().endswith(_END_CALL_MARKER)
+    if natural_end:
+        full_text = full_text.rstrip()[: -len(_END_CALL_MARKER)].rstrip()
+
+    if natural_end:
+        await sender.send(
+            {
+                "response_type": "response",
+                "response_id": response_id,
+                "content": "",
+                "content_complete": True,
+                "end_call": True,
+            }
+        )
+        logger.info(
+            "call_ended_by_agent",
+            org_id=str(org_id),
+            call_id=call_id,
+            reason="natural_conclusion",
+        )
+    else:
+        await sender.send_chunk(response_id, "", content_complete=True)
+
     logger.info(
         "voice_ws_send_response",
         org_id=str(org_id),
