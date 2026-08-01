@@ -39,6 +39,7 @@ export interface WhatsappConfigStepInput {
 
 export interface VoiceConfigStepInput {
   retell_agent_id: string;
+  supported_languages: string[];
 }
 
 export interface KnowledgeChunkInput {
@@ -106,6 +107,7 @@ export interface SetupStateResponse {
   whatsapp_phone_number: string | null;
   whatsapp_phone_number_id: string | null;
   voice_retell_agent_id: string | null;
+  voice_supported_languages: string[] | null;
 }
 
 export const WIZARD_STEP_KEYS = [

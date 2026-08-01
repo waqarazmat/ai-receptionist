@@ -114,6 +114,11 @@ async def save_whatsapp_config(db: AsyncSession, org_id: uuid.UUID, data: Whatsa
 async def save_voice_config(db: AsyncSession, org_id: uuid.UUID, data: VoiceConfigStep) -> ChannelConfig:
     config = await _get_or_create_channel_config(db, org_id, Channel.voice)
     config.config = {**(config.config or {}), "retell_agent_id": data.retell_agent_id}
+
+    org = await org_service.get_organization(db, org_id)
+    langs = data.supported_languages if data.supported_languages else ["en"]
+    org.supported_languages = langs
+
     await db.commit()
     await db.refresh(config)
     return config
@@ -253,4 +258,5 @@ async def get_setup_state(db: AsyncSession, org_id: uuid.UUID) -> SetupStateResp
         whatsapp_phone_number=config_by_channel.get(Channel.whatsapp, {}).get("phone_number"),
         whatsapp_phone_number_id=config_by_channel.get(Channel.whatsapp, {}).get("phone_number_id"),
         voice_retell_agent_id=config_by_channel.get(Channel.voice, {}).get("retell_agent_id"),
+        voice_supported_languages=org.supported_languages or ["en"],
     )

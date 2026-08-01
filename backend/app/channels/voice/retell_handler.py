@@ -203,6 +203,66 @@ _LANG_INFO: dict[str, dict] = {
         "instruction": "Sie MÜSSEN ausschließlich auf Deutsch antworten.",
         "keywords": {"deutsch", "german", "four", "vier"},
     },
+    "es": {
+        "menu_line": 'Para español, pulse {n} o diga "Español".',
+        "disclosure": "Esta llamada es atendida por un asistente de IA.",
+        "instruction": "Debes responder ÚNICAMENTE en español.",
+        "keywords": {"español", "espanol", "spanish", "five", "cinco"},
+    },
+    "it": {
+        "menu_line": 'Per italiano, premi {n} o dì "Italiano".',
+        "disclosure": "Questa chiamata è gestita da un assistente IA.",
+        "instruction": "Devi rispondere SOLO in italiano.",
+        "keywords": {"italiano", "italian", "six", "sei"},
+    },
+    "pt": {
+        "menu_line": 'Para português, pressione {n} ou diga "Português".',
+        "disclosure": "Esta chamada é atendida por um assistente de IA.",
+        "instruction": "Você DEVE responder SOMENTE em português.",
+        "keywords": {"português", "portugues", "portuguese", "seven", "sete"},
+    },
+    "ar": {
+        "menu_line": 'للعربية، اضغط {n} أو قل "عربي".',
+        "disclosure": "هذه المكالمة يعالجها مساعد ذكاء اصطناعي.",
+        "instruction": "يجب أن تُجيب باللغة العربية فقط.",
+        "keywords": {"عربي", "arabic", "eight", "ثمانية"},
+    },
+    "tr": {
+        "menu_line": 'Türkçe için {n}\'e basın veya "Türkçe" deyin.',
+        "disclosure": "Bu çağrı bir yapay zeka asistanı tarafından işlenmektedir.",
+        "instruction": "YALNIZCA Türkçe yanıt vermelisiniz.",
+        "keywords": {"türkçe", "turkce", "turkish", "nine", "dokuz"},
+    },
+    "ur": {
+        "menu_line": 'اردو کے لیے {n} دبائیں یا "اردو" کہیں۔',
+        "disclosure": "یہ کال ایک AI اسسٹنٹ کے ذریعے سنبھالی جا رہی ہے۔",
+        "instruction": "آپ کو صرف اردو میں جواب دینا ہوگا۔",
+        "keywords": {"اردو", "urdu", "ten", "دس"},
+    },
+    "hi": {
+        "menu_line": 'हिंदी के लिए {n} दबाएं या "हिंदी" कहें।',
+        "disclosure": "यह कॉल एक AI असिस्टेंट द्वारा संभाली जा रही है।",
+        "instruction": "आपको केवल हिंदी में उत्तर देना होगा।",
+        "keywords": {"हिंदी", "hindi", "eleven", "ग्यारह"},
+    },
+    "zh": {
+        "menu_line": '普通话请按{n}或说"中文"。',
+        "disclosure": "本次通话由AI助手处理。",
+        "instruction": "您必须只用中文回答。",
+        "keywords": {"中文", "chinese", "mandarin", "twelve", "十二"},
+    },
+    "ru": {
+        "menu_line": 'Для русского нажмите {n} или скажите "Русский".',
+        "disclosure": "Этот звонок обрабатывается ИИ-ассистентом.",
+        "instruction": "Вы ДОЛЖНЫ отвечать ТОЛЬКО на русском языке.",
+        "keywords": {"русский", "russian", "thirteen", "тринадцать"},
+    },
+    "pl": {
+        "menu_line": 'Dla języka polskiego naciśnij {n} lub powiedz "Polski".',
+        "disclosure": "To połączenie jest obsługiwane przez asystenta AI.",
+        "instruction": "Musisz odpowiadać WYŁĄCZNIE po polsku.",
+        "keywords": {"polski", "polish", "fourteen", "czternaście"},
+    },
 }
 
 

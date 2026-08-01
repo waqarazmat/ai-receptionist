@@ -49,6 +49,7 @@ class WhatsappConfigStep(BaseModel):
 
 class VoiceConfigStep(BaseModel):
     retell_agent_id: str
+    supported_languages: list[str] = ["en"]
 
 
 class KnowledgeChunkInput(BaseModel):
@@ -106,3 +107,4 @@ class SetupStateResponse(BaseModel):
     whatsapp_phone_number: str | None = None
     whatsapp_phone_number_id: str | None = None
     voice_retell_agent_id: str | None = None
+    voice_supported_languages: list[str] | None = None

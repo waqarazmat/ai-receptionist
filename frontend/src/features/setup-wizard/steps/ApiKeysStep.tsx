@@ -191,12 +191,60 @@ function ConfigFieldRow({
   );
 }
 
+const SUPPORTED_LANGUAGE_OPTIONS = [
+  { code: "en", label: "English" },
+  { code: "nl", label: "Dutch (Nederlands)" },
+  { code: "fr", label: "French (Français)" },
+  { code: "de", label: "German (Deutsch)" },
+  { code: "es", label: "Spanish (Español)" },
+  { code: "it", label: "Italian (Italiano)" },
+  { code: "pt", label: "Portuguese (Português)" },
+  { code: "ar", label: "Arabic (العربية)" },
+  { code: "tr", label: "Turkish (Türkçe)" },
+  { code: "ur", label: "Urdu (اردو)" },
+  { code: "hi", label: "Hindi (हिन्दी)" },
+  { code: "zh", label: "Chinese (中文)" },
+  { code: "ru", label: "Russian (Русский)" },
+  { code: "pl", label: "Polish (Polski)" },
+];
+
 export function ApiKeysStep({ orgId, setupState, onBack, onNext }: StepComponentProps) {
   const configured = new Set(setupState.api_keys_configured);
   const visibleProviders = PROVIDERS.filter((p) => p.visible(setupState));
   const showCalendarHelp = setupState.booking?.calendar_enabled;
   const saveWhatsappConfig = useSaveWhatsappConfig(orgId);
   const saveVoiceConfig = useSaveVoiceConfig(orgId);
+
+  const [selectedLanguages, setSelectedLanguages] = useState<string[]>(
+    setupState.voice_supported_languages ?? ["en"],
+  );
+  const [langSaving, setLangSaving] = useState(false);
+
+  useEffect(() => {
+    if (setupState.voice_supported_languages) {
+      setSelectedLanguages(setupState.voice_supported_languages);
+    }
+  }, [setupState.voice_supported_languages]);
+
+  const toggleLanguage = (code: string) => {
+    setSelectedLanguages((prev) =>
+      prev.includes(code) ? (prev.length > 1 ? prev.filter((c) => c !== code) : prev) : [...prev, code],
+    );
+  };
+
+  const saveLanguages = (agentId: string) => {
+    saveVoiceConfig.mutate({ retell_agent_id: agentId, supported_languages: selectedLanguages });
+  };
+
+  const saveLanguagesOnly = () => {
+    const agentId = setupState.voice_retell_agent_id ?? "";
+    if (!agentId) return;
+    setLangSaving(true);
+    saveVoiceConfig.mutate(
+      { retell_agent_id: agentId, supported_languages: selectedLanguages },
+      { onSettled: () => setLangSaving(false) },
+    );
+  };
 
   return (
     <div>
@@ -264,15 +312,50 @@ export function ApiKeysStep({ orgId, setupState, onBack, onNext }: StepComponent
               </>
             )}
             {key === "retell" && (
-              <ConfigFieldRow
-                label="Retell Agent ID"
-                placeholder="agent_xxxxxxxxxxxxxxxxxxxx"
-                helperText="Found in the Retell dashboard for this agent — separate from the API key above."
-                savedValue={setupState.voice_retell_agent_id}
-                isSaving={saveVoiceConfig.isPending}
-                onSave={(value) => saveVoiceConfig.mutate({ retell_agent_id: value })}
-                validate={(value) => (value.trim().length > 0 ? null : "Enter the Retell agent ID.")}
-              />
+              <>
+                <ConfigFieldRow
+                  label="Retell Agent ID"
+                  placeholder="agent_xxxxxxxxxxxxxxxxxxxx"
+                  helperText="Found in the Retell dashboard for this agent — separate from the API key above."
+                  savedValue={setupState.voice_retell_agent_id}
+                  isSaving={saveVoiceConfig.isPending}
+                  onSave={saveLanguages}
+                  validate={(value) => (value.trim().length > 0 ? null : "Enter the Retell agent ID.")}
+                />
+                {setupState.channels?.voice && (
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-800 p-4">
+                    <p className="text-sm font-medium text-slate-900 dark:text-slate-100 mb-1">
+                      Voice languages
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                      Select every language the caller can choose. When more than one is selected, the AI opens with a "press 1 for English / press 2 for …" menu.
+                    </p>
+                    <div className="flex flex-wrap gap-3">
+                      {SUPPORTED_LANGUAGE_OPTIONS.map(({ code, label }) => (
+                        <label key={code} className="flex items-center gap-2 cursor-pointer select-none text-sm">
+                          <input
+                            type="checkbox"
+                            checked={selectedLanguages.includes(code)}
+                            onChange={() => toggleLanguage(code)}
+                            className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                          />
+                          <span className="text-slate-700 dark:text-slate-300">{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                    {setupState.voice_retell_agent_id && (
+                      <button
+                        type="button"
+                        onClick={saveLanguagesOnly}
+                        disabled={langSaving}
+                        className="mt-3 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                      >
+                        {langSaving ? "Saving…" : "Save languages"}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </>
             )}
           </Fragment>
         ))}
