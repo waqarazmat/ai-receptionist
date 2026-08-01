@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import re
 import time
 import uuid
@@ -85,13 +84,6 @@ ws_router = APIRouter()
 
 RAG_TOP_K = 3
 VOICE_REMINDER_TEXT = "Are you still there? I'm happy to keep helping whenever you're ready."
-
-# Instant filler that goes on the wire the moment we know a turn started, so
-# Retell's TTS has something to speak while we run rate-limit / RAG / LLM. It's
-# sent with content_complete=False under the same response_id as the real
-# answer, so Retell concatenates it into a single utterance (no double-speak).
-# Trailing space matters: TTS runs "Mm-hmm," and the streamed answer together.
-_FILLERS = ["Mm-hmm, ", "Let's see, ", "One moment, "]
 
 # ── End-call detection ────────────────────────────────────────────────────────
 #
@@ -1091,21 +1083,6 @@ async def _handle_turn(
             await add_message(db, conversation_id, MessageRole.ai, "Goodbye!", Channel.voice)
         return
 
-    # Instant filler frame — nothing above this touches DB or LLM, so this
-    # goes on the wire ~1-3ms into the turn. Sent with content_complete=False
-    # under the real response_id so Retell keeps the utterance open and just
-    # appends the streamed answer to it. `collected` will start with this so
-    # the final persisted message text matches what was actually spoken.
-    filler = random.choice(_FILLERS)
-    await sender.send_chunk(response_id, filler, content_complete=False)
-    logger.info(
-        "voice_filler_sent_ms",
-        org_id=str(org_id),
-        call_id=call_id,
-        latency_ms=round((time.monotonic() - start) * 1000),
-        filler=filler.strip(),
-    )
-
     conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
 
     # Rate limit + rate-limited fallback path run on their own short-lived
@@ -1227,9 +1204,7 @@ async def _handle_turn(
     if len(state.org_supported_languages) > 1:
         system_prompt = f"{system_prompt}\n\n{_lang_instruction(state.selected_language)}"
 
-    # Seed with the filler frame we already sent, so the persisted transcript
-    # matches what the caller actually heard.
-    collected: list[str] = [filler]
+    collected: list[str] = []
     first_token_at: float | None = None
     first_frame_sent_at: float | None = None
     try:

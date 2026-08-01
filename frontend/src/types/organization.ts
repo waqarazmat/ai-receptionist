@@ -55,6 +55,7 @@ export interface OrgChannelStatus {
     agent_id: string | null;
     phone_number: string | null;
     retell_agent_id: string | null;
+    supported_languages: string[];
     // Whether Retell's Custom LLM URL for this agent points at this backend.
     // null when it couldn't be checked (no API key / agent id / Retell down).
     provisioned: boolean | null;

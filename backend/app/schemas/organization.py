@@ -87,6 +87,7 @@ class VoiceChannelStatus(BaseModel):
     agent_id: str | None
     phone_number: str | None
     retell_agent_id: str | None
+    supported_languages: list[str] = ["en"]
     # Whether the agent's Custom LLM URL in Retell currently points at this
     # backend for this org. None when it couldn't be checked (no RETELL_API_KEY,
     # no agent id, or Retell's API was unreachable).
