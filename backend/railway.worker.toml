@@ -1,0 +1,29 @@
+# Railway config for the ARQ WORKER service — kept SEPARATE from the web
+# service's railway.toml because the two need different start commands, and the
+# worker has no HTTP server (so: no healthcheck, and it must NOT be serverless).
+#
+# Point the worker service at this file:
+#   Railway → ai-receptionist-worker → Settings → Config-as-code
+#   → set the config file path to "railway.worker.toml"
+# (path is relative to the service Root Directory, which is `backend`).
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+# The background job consumer — NOT the web app. Runs continuously, polling
+# Redis for queued jobs (OTP emails, appointment reminders, WhatsApp
+# processing) and firing the cron jobs (reminders, calendar health, retention).
+startCommand = "arq app.tasks.worker.WorkerSettings"
+
+# Ensure the schema is migrated before the worker starts. Idempotent — the web
+# service runs this too; running it here just means the worker never boots
+# against an un-migrated DB if it deploys first.
+preDeployCommand = "alembic upgrade head"
+
+# Deliberately NO healthcheckPath: arq serves no HTTP, so a /health check would
+# never pass and the deploy would hang forever in "Building" — the exact bug
+# that kept the old uvicorn deployment live.
+
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

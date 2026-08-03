@@ -3,7 +3,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -50,6 +50,43 @@ if settings.SENTRY_DSN:
 
 configure_logging()
 logger = structlog.get_logger()
+
+
+class PublicWidgetCorsMiddleware(BaseHTTPMiddleware):
+    """Open CORS for the embeddable web-chat widget's public endpoints.
+
+    The widget's `cw.js` runs on arbitrary third-party customer sites and
+    fetches `/api/public/webchat/{org}/config` (and conversation history)
+    cross-origin before it renders. The global CORSMiddleware only allows the
+    configured CORS_ORIGINS (the admin panel), so on any real customer site
+    that fetch is blocked and the widget never mounts. These endpoints are
+    unauthenticated and send no credentials, so `Access-Control-Allow-Origin: *`
+    is both safe and required. Scoped to the webchat prefix only — webhooks and
+    admin/org APIs keep the strict allowlist. Registered OUTSIDE the global
+    CORSMiddleware so it has the final say on these paths.
+    """
+
+    _PREFIX = "/api/public/webchat"
+    _HEADERS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "600",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        is_widget = request.url.path.startswith(self._PREFIX)
+        if is_widget and request.method == "OPTIONS":
+            return Response(status_code=200, headers=self._HEADERS)
+        response = await call_next(request)
+        if is_widget:
+            for key, value in self._HEADERS.items():
+                response.headers[key] = value
+            # `*` origin is incompatible with credentials; the global CORS
+            # middleware may have added this for an allowlisted origin — drop it.
+            if "Access-Control-Allow-Credentials" in response.headers:
+                del response.headers["Access-Control-Allow-Credentials"]
+        return response
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -111,6 +148,9 @@ app.add_middleware(
 )
 app.add_middleware(IPRateLimitMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
+# Outermost — must wrap the global CORSMiddleware so it has the final word on
+# Access-Control-Allow-Origin for the public widget endpoints (any origin).
+app.add_middleware(PublicWidgetCorsMiddleware)
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(admin_router, prefix="/api/admin", tags=["super-admin"])
