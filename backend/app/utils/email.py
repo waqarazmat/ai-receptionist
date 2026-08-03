@@ -34,10 +34,13 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import aiosmtplib
+import httpx
 import jinja2
 import structlog
 
 from app.config import settings
+
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 logger = structlog.get_logger()
 
@@ -278,7 +281,153 @@ class EmailService:
         text_body: str | None = None,
         reply_to: str | None = None,
     ) -> None:
-        """Send an email, failing over to the secondary provider if the primary
+        """Send an email.
+
+        Transport order:
+          1. Brevo HTTP API (when BREVO_API_KEY is set) — port 443, so it works
+             even where the host blocks outbound SMTP ports (e.g. Railway).
+          2. SMTP relay (primary, then optional fallback) — used when there's no
+             API key, or as a last resort if the API call fails.
+
+        Raises:
+            EmailDeliveryError: when no transport succeeds. Never raises raw
+                httpx / aiosmtplib / OS exceptions — always wraps them.
+        """
+        api_exc: EmailDeliveryError | None = None
+        if settings.BREVO_API_KEY:
+            try:
+                await self._send_via_brevo_api(to, subject, html_body, text_body, reply_to)
+                return
+            except EmailDeliveryError as exc:
+                api_exc = exc
+                logger.warning(
+                    "email_brevo_api_failed_falling_back_to_smtp",
+                    to=to,
+                    subject=subject,
+                    error=str(exc),
+                )
+
+        # SMTP fallback. If SMTP isn't configured either, surface the API error
+        # (if any) rather than a generic "not configured" message.
+        if not (settings.SMTP_HOST and settings.SMTP_FROM_ADDRESS):
+            if api_exc is not None:
+                raise api_exc
+            raise EmailDeliveryError(
+                "No email transport configured. Set BREVO_API_KEY (HTTP API) "
+                "or SMTP_HOST + SMTP_FROM_ADDRESS."
+            )
+        await self._send_via_smtp(to, subject, html_body, text_body, reply_to)
+
+    # ── Brevo HTTP API transport (primary) ────────────────────────────────────
+
+    async def _send_via_brevo_api(
+        self,
+        to: str,
+        subject: str,
+        html_body: str,
+        text_body: str | None,
+        reply_to: str | None,
+    ) -> None:
+        """Send one email via Brevo's transactional API. Retries transient
+        (network / 5xx) failures; a 4xx (bad key, unverified sender) raises
+        immediately so it isn't pointlessly retried."""
+        sender_email = settings.SMTP_FROM_ADDRESS or settings.OTP_FROM_EMAIL
+        if not sender_email:
+            raise EmailDeliveryError(
+                "No sender address configured (set SMTP_FROM_ADDRESS or OTP_FROM_EMAIL)."
+            )
+
+        payload: dict = {
+            "sender": {"name": settings.SMTP_FROM_NAME, "email": sender_email},
+            "to": [{"email": to}],
+            "subject": subject,
+            "htmlContent": html_body,
+        }
+        if text_body:
+            payload["textContent"] = text_body
+        if reply_to:
+            payload["replyTo"] = {"email": reply_to}
+        headers = {
+            "api-key": settings.BREVO_API_KEY,
+            "content-type": "application/json",
+            "accept": "application/json",
+        }
+
+        last_exc: EmailDeliveryError | None = None
+        for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(BREVO_API_URL, json=payload, headers=headers)
+            except (httpx.HTTPError, OSError) as exc:
+                last_exc = EmailDeliveryError(f"Brevo API request failed: {exc}")
+                logger.warning(
+                    "email_brevo_api_attempt_failed",
+                    to=to,
+                    subject=subject,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+            else:
+                if resp.status_code in (200, 201):
+                    message_id = None
+                    try:
+                        message_id = resp.json().get("messageId")
+                    except ValueError:
+                        pass
+                    logger.info(
+                        "email_sent",
+                        to=to,
+                        subject=subject,
+                        provider="brevo_api",
+                        attempt=attempt,
+                        message_id=message_id,
+                    )
+                    return
+                if 400 <= resp.status_code < 500:
+                    # Permanent (bad key, unverified sender, invalid recipient) —
+                    # don't retry, and don't fall through to more attempts.
+                    logger.error(
+                        "email_brevo_api_rejected",
+                        to=to,
+                        subject=subject,
+                        status_code=resp.status_code,
+                        response_body=resp.text[:300],
+                    )
+                    raise EmailDeliveryError(
+                        f"Brevo API rejected the email (HTTP {resp.status_code}): {resp.text[:300]}",
+                        status_code=resp.status_code,
+                        body=resp.text[:500],
+                    )
+                # 5xx — transient, retry.
+                last_exc = EmailDeliveryError(
+                    f"Brevo API server error (HTTP {resp.status_code})",
+                    status_code=resp.status_code,
+                    body=resp.text[:500],
+                )
+                logger.warning(
+                    "email_brevo_api_attempt_failed",
+                    to=to,
+                    subject=subject,
+                    attempt=attempt,
+                    status_code=resp.status_code,
+                )
+
+            if delay is not None:
+                await asyncio.sleep(delay)
+
+        raise last_exc or EmailDeliveryError("Brevo API send failed after retries")
+
+    # ── SMTP transport (fallback) ─────────────────────────────────────────────
+
+    async def _send_via_smtp(
+        self,
+        to: str,
+        subject: str,
+        html_body: str,
+        text_body: str | None = None,
+        reply_to: str | None = None,
+    ) -> None:
+        """Send over SMTP, failing over to the secondary relay if the primary
         is unavailable.
 
         Delivery order:

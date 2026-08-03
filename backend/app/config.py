@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     # Point these at any standard SMTP relay — Amazon SES, Mailgun, Postmark,
     # Resend, etc. — by setting env vars. No code change required to switch
     # providers, only credentials.
+    # Brevo HTTP API (transactional email over HTTPS, port 443). Cloud hosts
+    # (Railway) commonly block/throttle outbound SMTP ports, so when this key is
+    # set EmailService sends via the API FIRST and only falls back to SMTP if
+    # the API call fails. Unset it to force pure SMTP. See app/utils/email.py.
+    BREVO_API_KEY: str | None = None
+    # Sender address for the Brevo API path; falls back to SMTP_FROM_ADDRESS.
+    OTP_FROM_EMAIL: str | None = None
+
     SMTP_HOST: str | None = None
     SMTP_PORT: int = 587
     SMTP_USERNAME: str | None = None

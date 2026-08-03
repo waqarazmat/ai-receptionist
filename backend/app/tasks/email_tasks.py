@@ -5,9 +5,11 @@ staff notifications, weekly digests, etc.  The request handler enqueues the
 job and returns immediately; delivery (including EmailService's built-in
 3-attempt retry and optional provider failover) happens in the worker process.
 
-OTP emails are intentionally NOT routed through here: the user is actively
-waiting for the code, so a synchronous send with a clean 502 on failure is
-the right UX.  See app/api/auth/router.py for that path.
+OTP emails ARE routed through here as well (see app/api/auth/router.py): the
+login endpoint enqueues the send and returns immediately with a generic
+message, so neither the response time nor its body reveals whether the email
+is registered (email-enumeration protection). A delivery failure surfaces via
+the dead-letter handling below rather than reaching the waiting user.
 
 Dead-letter handling
 --------------------
@@ -56,7 +58,7 @@ async def _post_alert(email_type: str, to: str, error: str) -> None:
         return
 
     text = (
-        f":rotating_light: *Email delivery failed* — all SMTP providers exhausted\n"
+        f":rotating_light: *Email delivery failed* — all delivery paths exhausted\n"
         f"• *type:* `{email_type}`\n"
         f"• *to:* `{to}`\n"
         f"• *error:* {error}"

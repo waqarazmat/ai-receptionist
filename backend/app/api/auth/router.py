@@ -19,7 +19,8 @@ from app.schemas.auth import (
     TokenResponse,
     VerifyOtpRequest,
 )
-from app.utils.email import EmailDeliveryError, send_otp_email
+from app.tasks.queue import get_arq_pool
+from app.utils.email import email_service
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -49,28 +50,32 @@ async def request_otp(body: RequestOtpRequest, session: AsyncSession = Depends(g
         # logged the hit internally.
         return MessageResponse(message=GENERIC_OTP_MESSAGE)
 
-    # Real user, OTP in Redis, now try to deliver it. On failure we prefer
-    # to surface the error to the caller so they can retry, rather than
-    # silently claim success while their inbox stays empty. This does mean
-    # an SMTP outage becomes distinguishable from a non-existent-email
-    # response (existent-broken -> 502, non-existent -> 200 generic) — an
-    # enumeration hint we accept in exchange for a working retry UX. If
-    # the enumeration property becomes critical, revisit by queueing sends
-    # via Arq and always returning 200 here.
-    # TEMPORARY: email delivery failures are swallowed here while we're
-    # between email providers (Brevo suspended, new provider not yet
-    # configured). REVERT to raising 502 once a working SMTP provider is
-    # confirmed — otherwise real users will get a false "success" with no
-    # actual OTP email and no way to know why they never received it.
+    # Deliver the OTP asynchronously via Arq. The endpoint returns immediately
+    # with the same generic message in every case — existent, non-existent, or
+    # relay-degraded — so neither the response body nor its timing reveals
+    # whether the email is registered (the email-enumeration guarantee).
+    # Delivery happens in the worker; if every provider is down, send_email_task
+    # surfaces it loudly (ERROR log + ops alert webhook + arq marks the job
+    # failed) rather than silently swallowing it as the old inline path did.
     try:
-        await send_otp_email(body.email, code)
-    except EmailDeliveryError as exc:
-        logger.warning(
-            "otp_email_send_failed",
-            email=body.email,
-            status_code=exc.status_code,
-            response_body=exc.body,
+        pool = await get_arq_pool()
+        await pool.enqueue_job(
+            "send_email_task",
+            to=body.email,
+            subject="Your verification code",
+            html_body=email_service.render("otp.html", otp_code=code),
+            text_body=(
+                f"Your verification code is {code}.\n\n"
+                "It expires in 10 minutes. If you didn't request this, "
+                "you can safely ignore this email."
+            ),
+            email_type="otp",
         )
+    except Exception:  # noqa: BLE001
+        # Enqueue itself failing (e.g. Redis unreachable) must not leak via an
+        # error status or slow timing — log loudly for ops and still return the
+        # generic message.
+        logger.exception("otp_email_enqueue_failed", email=body.email)
 
     return MessageResponse(message=GENERIC_OTP_MESSAGE)
 
