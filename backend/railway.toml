@@ -1,4 +1,6 @@
-# Railway build + deploy config for the FastAPI backend.
+# Railway build + deploy config, SHARED by both services built from `backend/`:
+#   - the web service  (FastAPI/uvicorn)
+#   - the worker service (arq) — set env RUN_WORKER=true on that service.
 # Root Directory is set in the Railway dashboard (Settings → Source) to
 # `backend`, so this file's location IS the effective build context.
 
@@ -13,11 +15,15 @@ builder = "NIXPACKS"
 # state, no manual `railway ssh` after every schema change.
 preDeployCommand = "alembic upgrade head"
 
-# $PORT is injected by Railway per deploy — never hardcode.
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/health"
-# Startup takes ~30-60s on cold boot because sentence-transformers loads
-# the all-MiniLM-L6-v2 model into memory. Give the healthcheck room.
-healthcheckTimeout = 120
+# One start command for BOTH services — railway-start.sh branches on RUN_WORKER
+# ($PORT is injected by Railway). This is the START (deploy) command, not a
+# build step. Keep the worker service free of any dashboard Custom Build/Start
+# Command so this drives it.
+startCommand = "bash railway-start.sh"
+
+# NO healthcheckPath: the arq worker serves no HTTP, so a /health check would
+# hang its deploy forever in "Building". The web service starts serving only
+# after the model loads anyway, so losing the health gate just means Railway
+# routes a few seconds earlier on a cold deploy.
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
