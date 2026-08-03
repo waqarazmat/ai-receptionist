@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import re
 import time
 import uuid
@@ -31,9 +32,23 @@ from app.config import settings
 from app.security.encryption import decrypt_api_key
 from app.security.rate_limiter import check_message_rate_limit, increment_message_count
 from app.security.webhook_verify import verify_retell_signature
+from app.services.booking_service import booking_session_active, process_booking_intent
 from app.services.conversation_service import STATIC_RATE_LIMIT_MESSAGE, add_message, get_conversation_messages
 
 logger = structlog.get_logger()
+
+# Lightweight keyword trigger to START a booking on voice. Voice deliberately
+# skips the analyze_message intent call for latency, so we detect the initial
+# booking intent with a cheap regex; once a booking is mid-flow, sticky routing
+# (booking_session_active) keeps every subsequent turn in the FSM regardless.
+_BOOKING_TRIGGER_RE = re.compile(
+    r"\b(book|appointment|schedul|reschedul|reserve|set up a time|make an appointment|come in for)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_booking_trigger(text: str) -> bool:
+    return bool(_BOOKING_TRIGGER_RE.search(text or ""))
 
 # Patterns for extracting the caller's name from voice transcripts.
 #
@@ -84,6 +99,13 @@ ws_router = APIRouter()
 
 RAG_TOP_K = 3
 VOICE_REMINDER_TEXT = "Are you still there? I'm happy to keep helping whenever you're ready."
+
+# Instant filler that goes on the wire the moment we know a turn started, so
+# Retell's TTS has something to speak while we run rate-limit / RAG / LLM. It's
+# sent with content_complete=False under the same response_id as the real
+# answer, so Retell concatenates it into a single utterance (no double-speak).
+# Trailing space matters: TTS runs "Mm-hmm," and the streamed answer together.
+_FILLERS = ["Mm-hmm, ", "Let's see, ", "One moment, "]
 
 # ── End-call detection ────────────────────────────────────────────────────────
 #
@@ -175,85 +197,85 @@ _LANG_INFO: dict[str, dict] = {
         "menu_line": 'For English, press {n} or say "English".',
         "disclosure": "This call is handled by an AI assistant.",
         "instruction": "You MUST respond ONLY in English.",
-        "keywords": {"english"},
+        "keywords": {"english", "one"},
     },
     "nl": {
         "menu_line": 'Voor Nederlands, druk {n} of zeg "Nederlands".',
         "disclosure": "Dit gesprek wordt behandeld door een AI-assistent.",
         "instruction": "U MOET uitsluitend in het Nederlands antwoorden.",
-        "keywords": {"nederlands", "dutch", "twee"},
+        "keywords": {"nederlands", "dutch", "two", "twee"},
     },
     "fr": {
         "menu_line": 'Pour le français, appuyez {n} ou dites "Français".',
         "disclosure": "Cet appel est traité par un assistant IA.",
         "instruction": "Vous DEVEZ répondre UNIQUEMENT en français.",
-        "keywords": {"français", "francais", "french", "trois"},
+        "keywords": {"français", "francais", "french", "three", "trois"},
     },
     "de": {
         "menu_line": 'Für Deutsch, drücken Sie {n} oder sagen Sie "Deutsch".',
         "disclosure": "Dieses Gespräch wird von einem KI-Assistenten bearbeitet.",
         "instruction": "Sie MÜSSEN ausschließlich auf Deutsch antworten.",
-        "keywords": {"deutsch", "german", "vier"},
+        "keywords": {"deutsch", "german", "four", "vier"},
     },
     "es": {
         "menu_line": 'Para español, pulse {n} o diga "Español".',
         "disclosure": "Esta llamada es atendida por un asistente de IA.",
         "instruction": "Debes responder ÚNICAMENTE en español.",
-        "keywords": {"español", "espanol", "spanish", "cinco"},
+        "keywords": {"español", "espanol", "spanish", "five", "cinco"},
     },
     "it": {
         "menu_line": 'Per italiano, premi {n} o dì "Italiano".',
         "disclosure": "Questa chiamata è gestita da un assistente IA.",
         "instruction": "Devi rispondere SOLO in italiano.",
-        "keywords": {"italiano", "italian", "sei"},
+        "keywords": {"italiano", "italian", "six", "sei"},
     },
     "pt": {
         "menu_line": 'Para português, pressione {n} ou diga "Português".',
         "disclosure": "Esta chamada é atendida por um assistente de IA.",
         "instruction": "Você DEVE responder SOMENTE em português.",
-        "keywords": {"português", "portugues", "portuguese", "sete"},
+        "keywords": {"português", "portugues", "portuguese", "seven", "sete"},
     },
     "ar": {
         "menu_line": 'للعربية، اضغط {n} أو قل "عربي".',
         "disclosure": "هذه المكالمة يعالجها مساعد ذكاء اصطناعي.",
         "instruction": "يجب أن تُجيب باللغة العربية فقط.",
-        "keywords": {"عربي", "arabic", "ثمانية"},
+        "keywords": {"عربي", "arabic", "eight", "ثمانية"},
     },
     "tr": {
         "menu_line": 'Türkçe için {n}\'e basın veya "Türkçe" deyin.',
         "disclosure": "Bu çağrı bir yapay zeka asistanı tarafından işlenmektedir.",
         "instruction": "YALNIZCA Türkçe yanıt vermelisiniz.",
-        "keywords": {"türkçe", "turkce", "turkish", "dokuz"},
+        "keywords": {"türkçe", "turkce", "turkish", "nine", "dokuz"},
     },
     "ur": {
         "menu_line": 'اردو کے لیے {n} دبائیں یا "اردو" کہیں۔',
         "disclosure": "یہ کال ایک AI اسسٹنٹ کے ذریعے سنبھالی جا رہی ہے۔",
         "instruction": "آپ کو صرف اردو میں جواب دینا ہوگا۔",
-        "keywords": {"اردو", "urdu", "دس"},
+        "keywords": {"اردو", "urdu", "ten", "دس"},
     },
     "hi": {
         "menu_line": 'हिंदी के लिए {n} दबाएं या "हिंदी" कहें।',
         "disclosure": "यह कॉल एक AI असिस्टेंट द्वारा संभाली जा रही है।",
         "instruction": "आपको केवल हिंदी में उत्तर देना होगा।",
-        "keywords": {"हिंदी", "hindi", "ग्यारह"},
+        "keywords": {"हिंदी", "hindi", "eleven", "ग्यारह"},
     },
     "zh": {
         "menu_line": '普通话请按{n}或说"中文"。',
         "disclosure": "本次通话由AI助手处理。",
         "instruction": "您必须只用中文回答。",
-        "keywords": {"中文", "chinese", "mandarin", "十二"},
+        "keywords": {"中文", "chinese", "mandarin", "twelve", "十二"},
     },
     "ru": {
         "menu_line": 'Для русского нажмите {n} или скажите "Русский".',
         "disclosure": "Этот звонок обрабатывается ИИ-ассистентом.",
         "instruction": "Вы ДОЛЖНЫ отвечать ТОЛЬКО на русском языке.",
-        "keywords": {"русский", "russian", "тринадцать"},
+        "keywords": {"русский", "russian", "thirteen", "тринадцать"},
     },
     "pl": {
         "menu_line": 'Dla języka polskiego naciśnij {n} lub powiedz "Polski".',
         "disclosure": "To połączenie jest obsługiwane przez asystenta AI.",
         "instruction": "Musisz odpowiadać WYŁĄCZNIE po polsku.",
-        "keywords": {"polski", "polish", "czternaście"},
+        "keywords": {"polski", "polish", "fourteen", "czternaście"},
     },
 }
 
@@ -269,52 +291,20 @@ def _build_language_menu(supported_languages: list[str]) -> str:
     return " ".join(lines)
 
 
-# English spoken words for menu positions 1-14.  Checked against the
-# caller's position in the current menu so "four" always matches whichever
-# language is at slot 4, regardless of what language that is.
-_POSITION_WORDS: dict[int, set[str]] = {
-    1: {"one"},
-    2: {"two"},
-    3: {"three"},
-    4: {"four"},
-    5: {"five"},
-    6: {"six"},
-    7: {"seven"},
-    8: {"eight"},
-    9: {"nine"},
-    10: {"ten"},
-    11: {"eleven"},
-    12: {"twelve"},
-    13: {"thirteen"},
-    14: {"fourteen"},
-}
-
-
 def _detect_language_choice(user_input: str, supported_languages: list[str]) -> str | None:
     """Return the ISO 639-1 code chosen by the caller, or None if unclear.
 
-    Accepts:
-    - DTMF/spoken digit ("1", "2", …)
-    - English spoken number word for the slot ("one", "two", "three", "four", …)
-    - Language name keywords in any supported language (e.g. "english", "urdu",
-      "nederlands", "اردو", …)
-
-    Position checks run before keyword scanning to avoid cross-language
-    ambiguity (e.g. "one" appearing as a substring in another word).
+    Accepts spoken/DTMF position numbers ("1", "2", …) and language keywords
+    in any supported language.  Position check runs first to short-circuit
+    before keyword scanning, which avoids cross-language ambiguity.
     """
     normalized = user_input.strip().lower()
     for idx, code in enumerate(supported_languages, start=1):
         info = _LANG_INFO.get(code)
         if not info:
             continue
-        # Digit: user pressed or said "4"
         if str(idx) in normalized:
             return code
-        # English spoken number word for this slot: "four", "two", etc.
-        pos_words = _POSITION_WORDS.get(idx, set())
-        if any(pw in normalized for pw in pos_words):
-            return code
-        # Language name keywords (native + English name, no number words)
         if any(kw in normalized for kw in info["keywords"]):
             return code
     return None
@@ -1115,6 +1105,21 @@ async def _handle_turn(
             await add_message(db, conversation_id, MessageRole.ai, "Goodbye!", Channel.voice)
         return
 
+    # Instant filler frame — nothing above this touches DB or LLM, so this
+    # goes on the wire ~1-3ms into the turn. Sent with content_complete=False
+    # under the real response_id so Retell keeps the utterance open and just
+    # appends the streamed answer to it. `collected` will start with this so
+    # the final persisted message text matches what was actually spoken.
+    filler = random.choice(_FILLERS)
+    await sender.send_chunk(response_id, filler, content_complete=False)
+    logger.info(
+        "voice_filler_sent_ms",
+        org_id=str(org_id),
+        call_id=call_id,
+        latency_ms=round((time.monotonic() - start) * 1000),
+        filler=filler.strip(),
+    )
+
     conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
 
     # Rate limit + rate-limited fallback path run on their own short-lived
@@ -1135,6 +1140,38 @@ async def _handle_turn(
         call_id=call_id,
         latency_ms=round((time.monotonic() - ratelimit_start) * 1000),
     )
+
+    # ── Booking fast path ─────────────────────────────────────────────────────
+    # Structured appointment booking runs through the same FSM as chat/WhatsApp.
+    # Once a booking is mid-flow we stay in it (sticky); otherwise a lightweight
+    # keyword trigger starts one. Either way we skip RAG/LLM generation and speak
+    # the FSM's next prompt, appended to the filler utterance already open. The
+    # FSM's own extraction handles free-text service/date/time; on voice the
+    # collected email is used for the appointment reminder emails.
+    booking_active = await booking_session_active(conversation_id)
+    if booking_active or _is_booking_trigger(message_text):
+        async with async_session_maker() as db:
+            conv = await db.get(Conversation, conversation_id)
+            contact_id = conv.contact_id if conv else None
+            reply = (
+                await process_booking_intent(db, org_id, conversation_id, contact_id, message_text)
+                if contact_id is not None
+                else FALLBACK_MESSAGE
+            )
+        await sender.send_chunk(response_id, " " + reply, content_complete=False)
+        await sender.send_chunk(response_id, "", content_complete=True)
+        full_text = f"{filler} {reply}"
+        async with async_session_maker() as db:
+            await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
+            await add_message(db, conversation_id, MessageRole.ai, full_text, Channel.voice)
+        logger.info(
+            "voice_booking_turn",
+            org_id=str(org_id),
+            call_id=call_id,
+            response_id=response_id,
+            booking_active=booking_active,
+        )
+        return
 
     # Independent work, in parallel:
     #   - fetch prior history            (own session — Postgres read)
@@ -1236,7 +1273,9 @@ async def _handle_turn(
     if len(state.org_supported_languages) > 1:
         system_prompt = f"{system_prompt}\n\n{_lang_instruction(state.selected_language)}"
 
-    collected: list[str] = []
+    # Seed with the filler frame we already sent, so the persisted transcript
+    # matches what the caller actually heard.
+    collected: list[str] = [filler]
     first_token_at: float | None = None
     first_frame_sent_at: float | None = None
     try:

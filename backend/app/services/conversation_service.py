@@ -16,7 +16,11 @@ from app.models.escalation import Escalation
 from app.models.message import Message
 from app.models.organization import Organization
 from app.security.rate_limiter import check_message_rate_limit, increment_message_count
-from app.services.booking_service import process_booking_intent
+from app.services.booking_service import (
+    booking_session_active,
+    clear_booking_session,
+    process_booking_intent,
+)
 
 logger = structlog.get_logger()
 
@@ -383,11 +387,20 @@ async def process_customer_message(
     contact = await db.get(Contact, conversation.contact_id)
     contact_name = contact.name if contact else None
 
+    # Sticky booking mode: once a booking is mid-flow, keep routing replies into
+    # the FSM regardless of how this message classified — the name/email and
+    # yes/no steps rarely look like a "booking" intent, and misrouting them to
+    # RAG is what abandons half-finished bookings. An explicit request for a
+    # human is the one thing allowed to break out.
+    booking_active = await booking_session_active(conversation_id)
+
     if intent == "escalation_request":
-        # f. Escalation
+        # f. Escalation — abandon any in-progress booking first.
+        if booking_active:
+            await clear_booking_session(conversation_id)
         await create_escalation(db, org_id, conversation_id, reason=message_text)
         response_text = ESCALATION_MESSAGE
-    elif intent in ("booking_request", "booking_info"):
+    elif booking_active or intent in ("booking_request", "booking_info"):
         # e. Booking — hands off to the FSM-driven booking flow instead of RAG.
         response_text = await process_booking_intent(
             db, org_id, conversation_id, conversation.contact_id, message_text, intent

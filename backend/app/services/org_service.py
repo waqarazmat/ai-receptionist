@@ -197,7 +197,6 @@ async def get_channel_status(db: AsyncSession, org_id: uuid.UUID) -> OrgChannelS
             agent_id=voice_config.get("retell_agent_id"),
             phone_number=voice_config.get("phone_number"),
             retell_agent_id=voice_config.get("retell_agent_id"),
-            supported_languages=org.supported_languages or ["en"],
             provisioned=voice_provisioned,
         ),
     )

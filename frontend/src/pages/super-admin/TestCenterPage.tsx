@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Check, Copy, ExternalLink, MessageCircle, MessageSquare, Phone, Plus, RefreshCw } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
@@ -8,28 +8,10 @@ import {
   useOrganization,
   useProvisionVoiceAgent,
 } from "../../api/organizations";
-import { useSaveVoiceConfig } from "../../api/setup-wizard";
 import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Card } from "../../components/ui/Card";
 import { Spinner } from "../../components/ui/Spinner";
-
-const VOICE_LANGUAGE_OPTIONS = [
-  { code: "en", label: "English" },
-  { code: "nl", label: "Dutch (Nederlands)" },
-  { code: "fr", label: "French (Français)" },
-  { code: "de", label: "German (Deutsch)" },
-  { code: "es", label: "Spanish (Español)" },
-  { code: "it", label: "Italian (Italiano)" },
-  { code: "pt", label: "Portuguese (Português)" },
-  { code: "ar", label: "Arabic (العربية)" },
-  { code: "tr", label: "Turkish (Türkçe)" },
-  { code: "ur", label: "Urdu (اردو)" },
-  { code: "hi", label: "Hindi (हिन्दी)" },
-  { code: "zh", label: "Chinese (中文)" },
-  { code: "ru", label: "Russian (Русский)" },
-  { code: "pl", label: "Polish (Polski)" },
-];
 
 // Real production embed URL — the actual client-facing embed snippet shown
 // to admins to copy onto a client's site.
@@ -213,33 +195,14 @@ function VoiceTestCard({
   configured,
   retellAgentId,
   provisioned,
-  supportedLanguages,
 }: {
   orgId: string;
   configured: boolean;
   retellAgentId: string | null;
   provisioned: boolean | null;
-  supportedLanguages: string[];
 }) {
   const provisionAgent = useProvisionVoiceAgent(orgId);
   const result = provisionAgent.data;
-  const saveVoiceConfig = useSaveVoiceConfig(orgId);
-
-  const [selectedLanguages, setSelectedLanguages] = useState<string[]>(supportedLanguages);
-  useEffect(() => { setSelectedLanguages(supportedLanguages); }, [supportedLanguages]);
-
-  const toggleLanguage = (code: string) => {
-    setSelectedLanguages((prev) =>
-      prev.includes(code)
-        ? prev.length > 1 ? prev.filter((c) => c !== code) : prev
-        : [...prev, code],
-    );
-  };
-
-  const saveLanguages = () => {
-    if (!retellAgentId) return;
-    saveVoiceConfig.mutate({ retell_agent_id: retellAgentId, supported_languages: selectedLanguages });
-  };
 
   return (
     <Card>
@@ -293,37 +256,6 @@ function VoiceTestCard({
           {provisionAgent.isError ? (
             <p className="text-xs text-red-600 dark:text-red-400">Re-provisioning request failed. Check the backend logs.</p>
           ) : null}
-
-          <div className="border-t border-slate-100 dark:border-slate-800 pt-3">
-            <p className="mb-2 text-xs font-medium text-slate-700 dark:text-slate-300">Voice languages</p>
-            <p className="mb-3 text-xs text-slate-500 dark:text-slate-400">
-              Select every language callers can choose. Selecting more than one enables an IVR language menu at the start of each call.
-            </p>
-            <div className="flex flex-wrap gap-x-4 gap-y-2 mb-3">
-              {VOICE_LANGUAGE_OPTIONS.map(({ code, label }) => (
-                <label key={code} className="flex items-center gap-2 cursor-pointer select-none text-xs">
-                  <input
-                    type="checkbox"
-                    checked={selectedLanguages.includes(code)}
-                    onChange={() => toggleLanguage(code)}
-                    className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                  />
-                  <span className="text-slate-700 dark:text-slate-300">{label}</span>
-                </label>
-              ))}
-            </div>
-            <button
-              type="button"
-              onClick={saveLanguages}
-              disabled={saveVoiceConfig.isPending}
-              className="rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
-            >
-              {saveVoiceConfig.isPending ? "Saving…" : "Save languages"}
-            </button>
-            {saveVoiceConfig.isSuccess && (
-              <p className="mt-2 text-xs text-emerald-600">Languages saved.</p>
-            )}
-          </div>
 
           <div className="border-t border-slate-100 dark:border-slate-800 pt-3">
             <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">
@@ -426,7 +358,6 @@ export default function TestCenterPage() {
               configured={channelStatus.voice.configured}
               retellAgentId={channelStatus.voice.retell_agent_id}
               provisioned={channelStatus.voice.provisioned}
-              supportedLanguages={channelStatus.voice.supported_languages}
             />
           )}
           {channelStatus.whatsapp.enabled && (

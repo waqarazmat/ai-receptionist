@@ -57,16 +57,20 @@ async def request_otp(body: RequestOtpRequest, session: AsyncSession = Depends(g
     # enumeration hint we accept in exchange for a working retry UX. If
     # the enumeration property becomes critical, revisit by queueing sends
     # via Arq and always returning 200 here.
+    # TEMPORARY: email delivery failures are swallowed here while we're
+    # between email providers (Brevo suspended, new provider not yet
+    # configured). REVERT to raising 502 once a working SMTP provider is
+    # confirmed — otherwise real users will get a false "success" with no
+    # actual OTP email and no way to know why they never received it.
     try:
         await send_otp_email(body.email, code)
     except EmailDeliveryError as exc:
-        logger.error(
+        logger.warning(
             "otp_email_send_failed",
             email=body.email,
             status_code=exc.status_code,
             response_body=exc.body,
         )
-        raise HTTPException(status_code=502, detail="Failed to send verification email. Please try again.")
 
     return MessageResponse(message=GENERIC_OTP_MESSAGE)
 

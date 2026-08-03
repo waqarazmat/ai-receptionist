@@ -53,10 +53,19 @@ class Settings(BaseSettings):
     # fallback only (see app/services/crawler_service.py).
     FIRECRAWL_API_KEY: str | None = None
 
-    # Path to a Google service account JSON key. Calendar access is granted
-    # per-org by the org sharing their calendar with this service account's
-    # client_email — no OAuth redirect flow. Optional — when unset, calendar
-    # features degrade gracefully (see app/booking/google_calendar.py).
+    # The platform's ONE shared Google service account. Calendar access is
+    # granted per-org by each org sharing their calendar with this service
+    # account's client_email (they only give us their calendar ID) — no OAuth
+    # redirect flow, and NOT a JSON key per org.
+    #
+    # Two ways to supply it (see app/booking/google_calendar.py):
+    #   GOOGLE_SERVICE_ACCOUNT_JSON  — the raw JSON key contents. Preferred in
+    #       production/Railway, where a gitignored key file wouldn't be deployed.
+    #   GOOGLE_SERVICE_ACCOUNT_FILE  — a path to the JSON key file. Convenient
+    #       for local dev.
+    # JSON takes precedence when both are set. Optional — when neither is set,
+    # calendar features degrade gracefully (booking still works, no event).
+    GOOGLE_SERVICE_ACCOUNT_JSON: str | None = None
     GOOGLE_SERVICE_ACCOUNT_FILE: str | None = None
 
     # WhatsApp (Meta Cloud API) — platform-level. One Meta App backs every
@@ -83,6 +92,12 @@ class Settings(BaseSettings):
 
     APP_ENV: str = "development"
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+
+    # Appointment reminders — the "soon" email/reminder fires this many minutes
+    # before the appointment start (in addition to the ~24h-before reminder).
+    # The reminder cron runs every 15 min, so effective firing is within one
+    # tick of this target.
+    REMINDER_LEAD_MINUTES: int = 60
 
     # Alerting webhook — optional. Paste a Slack or Discord incoming webhook
     # URL here. When set, critical background task failures (e.g. email

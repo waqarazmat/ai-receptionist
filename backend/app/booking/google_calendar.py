@@ -30,26 +30,45 @@ def _http_error_reasons(exc: HttpError) -> set[str]:
     except (ValueError, AttributeError, TypeError):
         return set()
 
-_service_account_email_cache: str | None | object = "_unset"
+_service_account_info_cache: dict | None | object = "_unset"
+
+
+def _load_service_account_info() -> dict | None:
+    """The platform's ONE shared service account as a dict, from whichever
+    source is configured (JSON env var preferred over file path). Read once and
+    cached — it never changes at runtime.
+
+    Returns None (and logs) when neither source is set or the value can't be
+    parsed; callers treat that as "calendar not configured" and degrade
+    gracefully rather than 500 (root CLAUDE.md rule #8)."""
+    global _service_account_info_cache
+    if _service_account_info_cache != "_unset":
+        return _service_account_info_cache  # type: ignore[return-value]
+
+    info: dict | None = None
+    if settings.GOOGLE_SERVICE_ACCOUNT_JSON:
+        # Raw JSON contents in an env var — the deploy-friendly path (a
+        # gitignored key file never reaches Railway).
+        try:
+            info = json.loads(settings.GOOGLE_SERVICE_ACCOUNT_JSON)
+        except ValueError as exc:
+            logger.warning("service_account_json_parse_failed", error=str(exc))
+    elif settings.GOOGLE_SERVICE_ACCOUNT_FILE:
+        try:
+            with open(settings.GOOGLE_SERVICE_ACCOUNT_FILE, encoding="utf-8") as f:
+                info = json.load(f)
+        except (OSError, ValueError) as exc:
+            logger.warning("service_account_file_read_failed", error=str(exc))
+
+    _service_account_info_cache = info
+    return info
 
 
 def get_service_account_email() -> str | None:
-    """The address an org needs to share their Google Calendar with — read
-    once from the key file and cached, since it never changes at runtime."""
-    global _service_account_email_cache
-    if _service_account_email_cache != "_unset":
-        return _service_account_email_cache  # type: ignore[return-value]
-
-    email = None
-    if settings.GOOGLE_SERVICE_ACCOUNT_FILE:
-        try:
-            with open(settings.GOOGLE_SERVICE_ACCOUNT_FILE, encoding="utf-8") as f:
-                email = json.load(f).get("client_email")
-        except (OSError, ValueError) as exc:
-            logger.warning("service_account_email_read_failed", error=str(exc))
-
-    _service_account_email_cache = email
-    return email
+    """The address an org needs to share their Google Calendar with — derived
+    from the shared service account key and shown to the org during setup."""
+    info = _load_service_account_info()
+    return info.get("client_email") if info else None
 
 
 class GoogleCalendarError(Exception):
@@ -68,17 +87,19 @@ class GoogleCalendarClient:
     instead of an LLM API key)."""
 
     def __init__(self, org_id: uuid.UUID, calendar_id: str):
-        if not settings.GOOGLE_SERVICE_ACCOUNT_FILE:
-            raise GoogleCalendarError("GOOGLE_SERVICE_ACCOUNT_FILE is not configured")
+        info = _load_service_account_info()
+        if info is None:
+            raise GoogleCalendarError(
+                "Google service account is not configured "
+                "(set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE)"
+            )
 
         self.org_id = org_id
         self.calendar_id = calendar_id
         try:
-            credentials = service_account.Credentials.from_service_account_file(
-                settings.GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES
-            )
+            credentials = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
             self._service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-        except (OSError, ValueError) as exc:
+        except (ValueError, KeyError) as exc:
             raise GoogleCalendarError(f"Failed to load service account credentials: {exc}") from exc
 
     @classmethod

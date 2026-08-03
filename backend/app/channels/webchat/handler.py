@@ -15,7 +15,11 @@ from app.models.enums import Channel, MessageRole
 from app.models.organization import Organization
 from app.realtime.socket_manager import chat_sio as sio
 from app.security.rate_limiter import check_message_rate_limit, increment_message_count
-from app.services.booking_service import process_booking_intent
+from app.services.booking_service import (
+    booking_session_active,
+    clear_booking_session,
+    process_booking_intent,
+)
 from app.services.conversation_service import (
     DECLINE_MESSAGE,
     STATIC_RATE_LIMIT_MESSAGE,
@@ -182,14 +186,23 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         contact = await db.get(Contact, conversation.contact_id)
         contact_name = contact.name if contact else None
 
+        # Sticky booking mode: once a booking is mid-flow, keep routing replies
+        # into the FSM regardless of how this message classified — the name/email
+        # and yes/no steps rarely look like a "booking" intent, and misrouting
+        # them to RAG is what abandons half-finished bookings. An explicit
+        # request for a human is the one thing allowed to break out.
+        booking_active = await booking_session_active(conversation_id)
+
         if intent == "escalation_request":
-            # f. Escalation
+            # f. Escalation — abandon any in-progress booking first.
+            if booking_active:
+                await clear_booking_session(conversation_id)
             await create_escalation(db, org_id, conversation_id, reason=message_text)
             await add_message(db, conversation_id, MessageRole.ai, ESCALATION_MESSAGE, Channel.webchat)
             await _send_complete_reply(sid, ESCALATION_MESSAGE)
             return
 
-        if intent in ("booking_request", "booking_info"):
+        if booking_active or intent in ("booking_request", "booking_info"):
             # e. Booking — hands off to the FSM-driven booking flow instead of RAG.
             response_text = await process_booking_intent(
                 db, org_id, conversation_id, conversation.contact_id, message_text, intent

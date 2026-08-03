@@ -105,6 +105,28 @@ async def _next_available_slots(
     return []
 
 
+async def booking_session_active(conversation_id: uuid.UUID) -> bool:
+    """True when this conversation has a booking mid-flow (past IDLE, not yet
+    terminal).
+
+    The channel routers use this to stay in "booking mode" once a booking has
+    started, routing every subsequent customer reply into the FSM instead of
+    re-classifying intent each turn. Without it, replies like a name+email
+    ("John, john@x.com") or a bare "yes" at the confirm step get classified as
+    off_topic/faq and fall through to RAG, abandoning the half-finished booking.
+    """
+    fsm = await BookingFSM.load(str(conversation_id))
+    return fsm.current_state not in (BookingState.IDLE, BookingState.BOOKED, BookingState.CANCELLED)
+
+
+async def clear_booking_session(conversation_id: uuid.UUID) -> None:
+    """Drop any in-progress booking state — used when the customer breaks out
+    of a booking (e.g. escalates to a human) so it doesn't linger in Redis and
+    re-capture their next, unrelated message."""
+    fsm = await BookingFSM.load(str(conversation_id))
+    await fsm.clear()
+
+
 async def process_booking_intent(
     db: AsyncSession,
     org_id: uuid.UUID,
@@ -132,7 +154,9 @@ async def process_booking_intent(
 
     previous_state = fsm.current_state
 
-    if previous_state in (BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
+    # Extract on the opening message (IDLE) too — details the customer already
+    # gave ("book a cleaning tomorrow at 2pm") must not be thrown away and re-asked.
+    if previous_state in (BookingState.IDLE, BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
         extracted = await _extract_booking_fields(
             db, org_id, user_input, list(service_by_name.keys()), org_timezone_name, org_tz
         )
@@ -143,15 +167,15 @@ async def process_booking_intent(
         if extracted.get("time"):
             fsm.collected_data["time"] = extracted["time"]
 
-        if previous_state == BookingState.COLLECTING_TIME and fsm.collected_data.get("date") and fsm.collected_data.get(
-            "time"
-        ):
+        # Whenever we now hold a concrete date+time, validate it against real
+        # availability; if it isn't bookable, drop it and offer alternatives.
+        if fsm.collected_data.get("date") and fsm.collected_data.get("time"):
             service = service_by_name.get(fsm.collected_data.get("service", ""), {})
             duration = service.get("duration_minutes", DEFAULT_SERVICE_DURATION_MINUTES)
             requested_dt = _parse_slot_datetime(fsm.collected_data["date"], fsm.collected_data["time"], org_tz)
 
-            slot_valid = requested_dt is not None and requested_dt in (
-                await slot_manager.get_available_slots(db, org_id, requested_dt.date(), duration)
+            slot_valid = requested_dt is not None and await slot_manager.is_slot_available(
+                db, org_id, requested_dt, duration
             )
             if not slot_valid:
                 fsm.collected_data.pop("date", None)
@@ -164,6 +188,16 @@ async def process_booking_intent(
                         f"{_format_slot_options(alternatives)}. What works for you?"
                     )
                 return "Sorry, that time isn't available and I couldn't find another opening soon — could you try a different day?"
+
+        # Fast-forward past steps already satisfied on the opening message, so
+        # we don't greet-and-ask "what service?" when they already told us. The
+        # FSM's IDLE/service handlers only prompt; they don't skip ahead.
+        if previous_state == BookingState.IDLE:
+            cd = fsm.collected_data
+            if cd.get("service") and cd.get("date") and cd.get("time"):
+                fsm.current_state = BookingState.COLLECTING_TIME
+            elif cd.get("service"):
+                fsm.current_state = BookingState.COLLECTING_SERVICE
 
     elif previous_state == BookingState.COLLECTING_CONTACT_INFO:
         extracted = await _extract_contact_info(db, org_id, user_input)
@@ -233,6 +267,12 @@ async def _finalize_booking(
 
     held = await slot_manager.hold_slot(org_id, start, contact_id)
     if not held:
+        return "Sorry, that slot was just taken by someone else. Could you pick another time?"
+
+    # Final guard against an overlapping appointment created between slot
+    # validation and now (the Redis hold only covers this exact start time).
+    if await slot_manager.has_conflicting_appointment(db, org_id, start, end):
+        await slot_manager.release_slot(org_id, start, contact_id)
         return "Sorry, that slot was just taken by someone else. Could you pick another time?"
 
     try:

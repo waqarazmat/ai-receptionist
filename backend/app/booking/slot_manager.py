@@ -3,10 +3,13 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.booking.google_calendar import GoogleCalendarClient, GoogleCalendarError
 from app.db.redis import redis_client
+from app.models.appointment import Appointment
+from app.models.enums import AppointmentStatus
 from app.models.organization import Organization
 
 logger = structlog.get_logger()
@@ -78,6 +81,91 @@ def _working_hours_for(org: Organization | None, day: date) -> tuple[time, time]
     return open_time, close_time
 
 
+async def _busy_ranges(
+    db: AsyncSession, org_id: uuid.UUID, window_start: datetime, window_end: datetime
+) -> list[tuple[datetime, datetime]]:
+    """All busy intervals overlapping [window_start, window_end): Google
+    Calendar free/busy PLUS confirmed appointments already in our own DB.
+
+    The DB half is the durable double-booking guard: the 5-minute Redis hold is
+    released the moment an appointment is saved, and many orgs have no Google
+    Calendar configured (or its event creation failed), so without checking our
+    own appointments the same slot could be handed out twice.
+    """
+    ranges: list[tuple[datetime, datetime]] = []
+
+    try:
+        client = await GoogleCalendarClient.for_org(db, org_id)
+        for period in await client.get_free_busy(window_start, window_end):
+            ranges.append((datetime.fromisoformat(period["start"]), datetime.fromisoformat(period["end"])))
+    except GoogleCalendarError as exc:
+        logger.warning("calendar_unavailable_for_slots", org_id=str(org_id), error=str(exc))
+
+    appt_rows = (
+        await db.execute(
+            select(Appointment.start_time, Appointment.end_time).where(
+                Appointment.org_id == org_id,
+                Appointment.status == AppointmentStatus.confirmed,
+                Appointment.end_time > window_start,
+                Appointment.start_time < window_end,
+            )
+        )
+    ).all()
+    ranges.extend((start, end) for start, end in appt_rows)
+    return ranges
+
+
+async def has_conflicting_appointment(
+    db: AsyncSession, org_id: uuid.UUID, start: datetime, end: datetime
+) -> bool:
+    """Final pre-write double-booking check: is there already a confirmed
+    appointment overlapping [start, end)? Cheap (DB only, no Calendar) so it's
+    safe to call right before creating the appointment, closing the race
+    between slot validation and the actual write."""
+    row = (
+        await db.execute(
+            select(Appointment.id)
+            .where(
+                Appointment.org_id == org_id,
+                Appointment.status == AppointmentStatus.confirmed,
+                Appointment.end_time > start,
+                Appointment.start_time < end,
+            )
+            .limit(1)
+        )
+    ).first()
+    return row is not None
+
+
+async def is_slot_available(
+    db: AsyncSession, org_id: uuid.UUID, requested_dt: datetime, service_duration_minutes: int
+) -> bool:
+    """Whether a specific requested start time can actually be booked — within
+    working hours, not overlapping Calendar/DB busy ranges, not currently held.
+
+    Replaces the old "is requested_dt in the (truncated) suggestion list?"
+    check, which wrongly rejected any valid time past the first few slots of
+    the day."""
+    org = await db.get(Organization, org_id)
+    hours = _working_hours_for(org, requested_dt.date())
+    if hours is None:
+        return False
+    open_time, close_time = hours
+    org_tz = resolve_org_timezone(org)
+
+    day_start = datetime.combine(requested_dt.date(), open_time, tzinfo=org_tz)
+    day_end = datetime.combine(requested_dt.date(), close_time, tzinfo=org_tz)
+    slot_end = requested_dt + timedelta(minutes=service_duration_minutes)
+    if requested_dt < day_start or slot_end > day_end:
+        return False
+
+    busy_ranges = await _busy_ranges(db, org_id, day_start, day_end)
+    if any(requested_dt < busy_end and slot_end > busy_start for busy_start, busy_end in busy_ranges):
+        return False
+
+    return not await is_slot_held(org_id, requested_dt)
+
+
 async def get_available_slots(
     db: AsyncSession,
     org_id: uuid.UUID,
@@ -101,16 +189,7 @@ async def get_available_slots(
     if day_start >= day_end:
         return []
 
-    busy_ranges: list[tuple[datetime, datetime]] = []
-    try:
-        client = await GoogleCalendarClient.for_org(db, org_id)
-        busy_periods = await client.get_free_busy(day_start, day_end)
-        busy_ranges = [
-            (datetime.fromisoformat(period["start"]), datetime.fromisoformat(period["end"]))
-            for period in busy_periods
-        ]
-    except GoogleCalendarError as exc:
-        logger.warning("calendar_unavailable_for_slots", org_id=str(org_id), error=str(exc))
+    busy_ranges = await _busy_ranges(db, org_id, day_start, day_end)
 
     slots: list[datetime] = []
     cursor = day_start
