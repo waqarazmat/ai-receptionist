@@ -8,12 +8,12 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Run migrations before every deploy. Railway executes preDeployCommand in
-# a one-shot container that shares the same env + network as the service,
-# so `alembic upgrade head` reaches the same Postgres. If it fails, the
-# deploy aborts and the previous version keeps serving — no half-migrated
-# state, no manual `railway ssh` after every schema change.
-preDeployCommand = "alembic upgrade head"
+# Run migrations before every deploy — but ONLY on the web service. The worker
+# (RUN_WORKER=true) skips them via the script: it doesn't need to migrate, and
+# alembic in the worker's one-shot pre-deploy container was failing to reach
+# Postgres and aborting the deploy. The web service still runs the migration;
+# if it fails there, the deploy aborts and the previous version keeps serving.
+preDeployCommand = "bash railway-predeploy.sh"
 
 # One start command for BOTH services — railway-start.sh branches on RUN_WORKER
 # ($PORT is injected by Railway). This is the START (deploy) command, not a
