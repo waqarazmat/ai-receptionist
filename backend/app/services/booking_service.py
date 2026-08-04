@@ -14,6 +14,8 @@ from app.booking.slot_manager import resolve_org_timezone
 from app.models.contact import Contact
 from app.models.organization import Organization
 from app.services import appointment_service
+from app.tasks.queue import get_arq_pool
+from app.utils.email import email_service
 
 logger = structlog.get_logger()
 
@@ -244,6 +246,49 @@ async def process_booking_intent(
     return response_text
 
 
+async def _enqueue_confirmation_email(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    to_email: str,
+    contact_name: str | None,
+    service_name: str,
+    start_local: datetime,
+) -> None:
+    """Queue an immediate 'appointment confirmed' email to the customer.
+
+    Enqueued to the Arq worker so it never blocks the booking reply, and
+    best-effort — any failure is logged, never raised, so it can't undo a
+    completed booking. `start_local` is already in the org's timezone.
+    """
+    org = await db.get(Organization, org_id)
+    org_name = org.name if org else "us"
+    date_str = start_local.strftime("%A, %B %d")
+    time_str = _format_time(start_local)
+    ctx = {
+        "contact_name": contact_name or "there",
+        "service_name": service_name,
+        "org_name": org_name,
+        "date": date_str,
+        "time": time_str,
+    }
+    try:
+        pool = await get_arq_pool()
+        await pool.enqueue_job(
+            "send_email_task",
+            to=to_email,
+            subject=f"Your {service_name} is confirmed — {date_str}",
+            html_body=email_service.render("appointment_confirmation.html", **ctx),
+            text_body=(
+                f"Hi {ctx['contact_name']}, your {service_name} appointment with {org_name} "
+                f"is confirmed for {date_str} at {time_str}. We'll send a reminder beforehand. "
+                f"Need to change it? Just reply to this email or give us a call."
+            ),
+            email_type="appointment_confirmation",
+        )
+    except Exception:  # noqa: BLE001 — a confirmation email must never break a booking
+        logger.warning("confirmation_email_enqueue_failed", org_id=str(org_id))
+
+
 async def _finalize_booking(
     db: AsyncSession,
     org_id: uuid.UUID,
@@ -308,6 +353,15 @@ async def _finalize_booking(
             end.astimezone(timezone.utc),
             google_event_id,
         )
+
+        # Immediate booking-confirmation email to the customer (queued to the
+        # worker — never blocks the reply). Followed later by the 24h + 1h
+        # reminder emails from the reminder cron.
+        customer_email = fsm.collected_data.get("customer_email") or (contact.email if contact else None)
+        if customer_email:
+            await _enqueue_confirmation_email(
+                db, org_id, customer_email, contact.name if contact else None, service_name, start
+            )
     finally:
         await slot_manager.release_slot(org_id, start, contact_id)
 
