@@ -19,6 +19,10 @@ SLOT_INTERVAL_MINUTES = 30
 DEFAULT_OPEN_TIME = time(9, 0)
 DEFAULT_CLOSE_TIME = time(17, 0)
 DEFAULT_MAX_SLOTS_RETURNED = 6
+# Never offer or accept a slot starting sooner than this from now — avoids
+# suggesting times that have already passed earlier today, and blocks
+# "book 5 minutes from now" requests.
+MIN_BOOKING_LEAD_MINUTES = 30
 
 
 def resolve_org_timezone(org: Organization | None) -> ZoneInfo:
@@ -153,6 +157,10 @@ async def is_slot_available(
     open_time, close_time = hours
     org_tz = resolve_org_timezone(org)
 
+    # Reject times in the past / too soon (e.g. a 9 AM slot requested at 5 PM).
+    if requested_dt < datetime.now(org_tz) + timedelta(minutes=MIN_BOOKING_LEAD_MINUTES):
+        return False
+
     day_start = datetime.combine(requested_dt.date(), open_time, tzinfo=org_tz)
     day_end = datetime.combine(requested_dt.date(), close_time, tzinfo=org_tz)
     slot_end = requested_dt + timedelta(minutes=service_duration_minutes)
@@ -191,12 +199,18 @@ async def get_available_slots(
 
     busy_ranges = await _busy_ranges(db, org_id, day_start, day_end)
 
+    # Don't offer slots in the past / too soon (e.g. today's 9 AM when it's 5 PM).
+    earliest = datetime.now(org_tz) + timedelta(minutes=MIN_BOOKING_LEAD_MINUTES)
+
     slots: list[datetime] = []
     cursor = day_start
     step = timedelta(minutes=SLOT_INTERVAL_MINUTES)
     duration = timedelta(minutes=service_duration_minutes)
 
     while cursor + duration <= day_end and len(slots) < max_results:
+        if cursor < earliest:
+            cursor += step
+            continue
         slot_end = cursor + duration
         overlaps_busy = any(cursor < busy_end and slot_end > busy_start for busy_start, busy_end in busy_ranges)
         if not overlaps_busy and not await is_slot_held(org_id, cursor):

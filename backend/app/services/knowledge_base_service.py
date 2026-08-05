@@ -1,3 +1,4 @@
+import re
 import uuid
 
 from sqlalchemy import select
@@ -12,6 +13,57 @@ from app.services.crawler_service import crawl_website
 
 class ChunkNotFoundError(Exception):
     pass
+
+
+# ── Voice ASR keyword boosting ────────────────────────────────────────────────
+# Curated brand/tech terms the product commonly involves that ASR mangles.
+_PLATFORM_VOICE_KEYWORDS = [
+    "GenAITech", "Calendly", "HubSpot", "Twilio", "Deepgram", "ElevenLabs",
+    "Zapier", "Slack", "WhatsApp", "Retell", "Pinecone", "Cohere", "Groq", "OpenAI", "DeepL",
+]
+# 2-3 word Capitalized sequences → proper nouns (client/product names, e.g.
+# "Klara Dental", "Google Calendar"). Clean signal; the single-token camelCase
+# pass was dropped because it caught crawler whitespace artifacts.
+_KB_PROPER_NOUN_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b")
+_KW_STOPWORDS = {
+    "the", "this", "that", "we", "our", "you", "it", "if", "in", "on", "at", "for",
+    "and", "but", "or", "so", "how", "what", "when", "where", "why", "your", "their",
+    "these", "those", "with", "from", "book", "great", "coming", "explore", "subscribe", "weekly",
+}
+
+
+async def build_boosted_keywords(
+    db: AsyncSession, org_id: uuid.UUID, org_name: str | None, limit: int = 50
+) -> list[str]:
+    """A voice-ASR keyword-boost list for an org, derived from its OWN knowledge
+    base (the exact proper nouns — brand, client, and product names — that get
+    mis-transcribed) plus a curated platform tech-term list. Self-maintaining:
+    it grows with the KB, so there's no hand-kept list to drift. Pushed into the
+    Retell agent's `boosted_keywords` at provisioning time (see
+    channels/voice/retell_provisioner.py)."""
+    kws: dict[str, str] = {}
+
+    def add(term: str) -> None:
+        term = re.sub(r"\s+", " ", term).strip()
+        if 3 <= len(term) <= 40 and term.split()[0].lower() not in _KW_STOPWORDS:
+            kws.setdefault(term.lower(), term)
+
+    if org_name:
+        add(org_name)
+    for kw in _PLATFORM_VOICE_KEYWORDS:
+        add(kw)
+
+    try:
+        rows = (
+            await db.execute(select(KnowledgeChunk.content).where(KnowledgeChunk.org_id == org_id).limit(300))
+        ).scalars().all()
+    except Exception:  # noqa: BLE001 — keyword boosting is best-effort; never break provisioning
+        rows = []
+    for content in rows:
+        for match in _KB_PROPER_NOUN_RE.finditer(content or ""):
+            add(match.group(1))
+
+    return list(kws.values())[:limit]
 
 
 class KnowledgeBaseNotFoundError(Exception):

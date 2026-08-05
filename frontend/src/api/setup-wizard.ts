@@ -41,6 +41,27 @@ export function useSetupState(orgId: string) {
   });
 }
 
+export interface SystemPromptPreview {
+  chat: string;
+  voice: string;
+  chat_chars: number;
+  voice_chars: number;
+}
+
+/** The full assembled system prompt the AI actually receives (org config +
+ * built-in guardrails). Read-only. `enabled` lets the step fetch it lazily,
+ * only when the admin opens the preview. */
+export function useSystemPromptPreview(orgId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: [...setupWizardKey(orgId), "system-prompt-preview"] as const,
+    queryFn: () =>
+      apiClient
+        .get<SystemPromptPreview>(`/api/admin/organizations/${orgId}/system-prompt-preview`)
+        .then((r) => r.data),
+    enabled: Boolean(orgId) && enabled,
+  });
+}
+
 export function useSaveBasicInfo(orgId: string) {
   const invalidate = useInvalidateAfterSave(orgId);
   return useMutation({

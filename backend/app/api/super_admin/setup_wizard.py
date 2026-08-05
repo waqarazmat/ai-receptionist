@@ -201,9 +201,11 @@ async def save_voice_config(
     # Auto-configure the agent in Retell so the super admin never touches
     # Retell's dashboard. Provisioning failure is non-fatal: the agent id is
     # already saved above; we just warn so it can be set by hand if needed.
+    org = await org_service.get_organization(db, org_id)
+    keywords = await knowledge_base_service.build_boosted_keywords(db, org_id, org.name)
     result: dict = {"retell_agent_id": agent_id, "provisioned": False}
     try:
-        provision = await retell_provisioner.provision_agent(str(org_id), agent_id)
+        provision = await retell_provisioner.provision_agent(str(org_id), agent_id, boosted_keywords=keywords)
         result["provisioned"] = True
         result["llm_websocket_url"] = provision["llm_websocket_url"]
         result["webhook_url"] = provision["webhook_url"]

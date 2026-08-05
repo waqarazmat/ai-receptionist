@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ChevronDown, Sparkles } from "lucide-react";
-import { useSaveSystemPrompts } from "../../../api/setup-wizard";
+import { ChevronDown, Eye, Sparkles } from "lucide-react";
+import { useSaveSystemPrompts, useSystemPromptPreview } from "../../../api/setup-wizard";
 import { Button } from "../../../components/ui/Button";
 import { Textarea } from "../../../components/ui/Textarea";
 import { StepCard } from "../StepCard";
@@ -24,6 +24,12 @@ export function SystemPromptsStep({ orgId, setupState, onBack, onNext }: StepCom
 
   const [pickerOpen, setPickerOpen] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
+
+  // Read-only preview of the FULL assembled prompt the AI receives. Fetched
+  // lazily — only once the admin opens the panel.
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewMode, setPreviewMode] = useState<"chat" | "voice">("chat");
+  const preview = useSystemPromptPreview(orgId, previewOpen);
 
   const saveSystemPrompts = useSaveSystemPrompts(orgId);
 
@@ -79,6 +85,64 @@ export function SystemPromptsStep({ orgId, setupState, onBack, onNext }: StepCom
       description="Shape how the AI receptionist talks to customers — its greeting, tone, and boundaries."
     >
       <form onSubmit={handleSubmit} className="space-y-4">
+        {/* Read-only preview of the full prompt the AI actually receives —
+            assembled from the fields below + built-in guardrails. */}
+        <div className="rounded-lg border border-slate-200 dark:border-slate-700">
+          <button
+            type="button"
+            onClick={() => setPreviewOpen((o) => !o)}
+            className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left"
+          >
+            <span className="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-200">
+              <Eye className="h-4 w-4" />
+              View the full system prompt the AI actually uses
+            </span>
+            <ChevronDown
+              className={`h-4 w-4 shrink-0 text-slate-400 transition-transform ${previewOpen ? "rotate-180" : ""}`}
+            />
+          </button>
+
+          {previewOpen && (
+            <div className="border-t border-slate-200 px-4 py-3 dark:border-slate-700">
+              <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">
+                Assembled from the fields below plus built-in safety guardrails and guidelines —
+                this is exactly what the model sees on every message. (The knowledge/RAG context is
+                added per-message and omitted here.) Read-only; edit the fields below to change it.
+              </p>
+              <div className="mb-2 inline-flex rounded-md border border-slate-200 p-0.5 dark:border-slate-700">
+                {(["chat", "voice"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setPreviewMode(m)}
+                    className={`rounded px-3 py-1 text-xs font-medium capitalize transition-colors ${
+                      previewMode === m
+                        ? "bg-indigo-600 text-white"
+                        : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-700/60"
+                    }`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+              {preview.isLoading ? (
+                <p className="text-sm text-slate-400">Loading…</p>
+              ) : preview.isError ? (
+                <p className="text-sm text-rose-500">Couldn't load the prompt preview.</p>
+              ) : (
+                <>
+                  <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md bg-slate-50 p-3 text-xs leading-relaxed text-slate-700 dark:bg-slate-900 dark:text-slate-200">
+                    {previewMode === "chat" ? preview.data?.chat : preview.data?.voice}
+                  </pre>
+                  <p className="mt-1 text-[11px] text-slate-400">
+                    {(previewMode === "chat" ? preview.data?.chat_chars : preview.data?.voice_chars) ?? 0} characters
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
         <Textarea
           label="Greeting message"
           placeholder="Hi! Welcome to Acme Dental. How can I help you today?"

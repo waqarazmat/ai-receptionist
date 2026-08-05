@@ -4,9 +4,11 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.ai.prompts.receptionist_system import get_system_prompt
 from app.api.deps import get_admin_db_session, require_super_admin
 from app.channels.voice import retell_provisioner
 from app.config import settings
+from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.organization import (
     OrgChannelStatusResponse,
@@ -17,7 +19,7 @@ from app.schemas.organization import (
     OrganizationUpdate,
 )
 from app.schemas.setup_wizard import VoiceConfigStep
-from app.services import org_service, setup_wizard_service
+from app.services import knowledge_base_service, org_service, setup_wizard_service
 from app.services.audit_service import log_action
 
 router = APIRouter()
@@ -69,6 +71,42 @@ async def get_organization_channel_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
 
 
+@router.get("/organizations/{org_id}/system-prompt-preview")
+async def get_system_prompt_preview(
+    org_id: uuid.UUID, db: AsyncSession = Depends(get_admin_db_session)
+) -> dict:
+    """The full system prompt the AI actually receives, assembled from the org's
+    saved prompts PLUS the built-in per-vertical guardrails and guidelines. This
+    is what's constructed by app.ai.prompts.receptionist_system.get_system_prompt
+    on every message — read-only, so admins can see exactly what the model sees.
+
+    `knowledge_context` is left blank here because it's injected per-message from
+    RAG; everything else is the static, org-configured scaffold.
+    """
+    org = await db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    prompts = org.system_prompts or {}
+    org_config = {
+        "org_name": org.name,
+        "greeting": prompts.get("greeting"),
+        "personality": prompts.get("personality"),
+        "escalation_rules": prompts.get("escalation_rules"),
+        "custom_system_prompt": prompts.get("system_prompt"),
+        "business_vertical": org.business_vertical.value if org.business_vertical else None,
+        "knowledge_context": "",
+    }
+    chat_prompt = get_system_prompt(org_config, voice_mode=False)
+    voice_prompt = get_system_prompt(org_config, voice_mode=True)
+    return {
+        "chat": chat_prompt,
+        "voice": voice_prompt,
+        "chat_chars": len(chat_prompt),
+        "voice_chars": len(voice_prompt),
+    }
+
+
 @router.post("/organizations/{org_id}/voice/provision")
 async def reprovision_voice_agent(
     org_id: uuid.UUID,
@@ -91,9 +129,11 @@ async def reprovision_voice_agent(
             detail="No Retell Agent ID is configured for this organization.",
         )
 
+    org = await db.get(Organization, org_id)
+    keywords = await knowledge_base_service.build_boosted_keywords(db, org_id, org.name if org else None)
     result: dict = {"retell_agent_id": agent_id, "provisioned": False}
     try:
-        provision = await retell_provisioner.provision_agent(str(org_id), agent_id)
+        provision = await retell_provisioner.provision_agent(str(org_id), agent_id, boosted_keywords=keywords)
         result["provisioned"] = True
         result["llm_websocket_url"] = provision["llm_websocket_url"]
         result["webhook_url"] = provision["webhook_url"]
@@ -131,8 +171,9 @@ async def create_voice_agent(
     except org_service.OrganizationNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
 
+    keywords = await knowledge_base_service.build_boosted_keywords(db, org_id, org.name)
     try:
-        created = await retell_provisioner.create_agent(str(org_id), org.name)
+        created = await retell_provisioner.create_agent(str(org_id), org.name, boosted_keywords=keywords)
     except retell_provisioner.RetellProvisioningError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not create Retell agent: {exc}")
 

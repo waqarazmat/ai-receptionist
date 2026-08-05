@@ -82,7 +82,7 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.RETELL_API_KEY}"}
 
 
-async def create_agent(org_id: str, org_name: str) -> dict:
+async def create_agent(org_id: str, org_name: str, boosted_keywords: list[str] | None = None) -> dict:
     """Create a brand-new Retell agent wired to this backend from scratch, so we
     control the full config instead of relying on a hand-made agent.
 
@@ -110,6 +110,10 @@ async def create_agent(org_id: str, org_name: str) -> dict:
         "voice_id": DEFAULT_VOICE_ID,
         "webhook_url": webhook_url,
     }
+    if boosted_keywords:
+        # ASR keyword boost — helps Retell's transcriber recognize the org's
+        # brand/client/product names (see knowledge_base_service.build_boosted_keywords).
+        payload["boosted_keywords"] = boosted_keywords
     url = f"{RETELL_API_BASE}/create-agent"
 
     logger.info("retell_create_request", org_id=org_id, url=url, payload=payload)
@@ -148,7 +152,9 @@ async def create_agent(org_id: str, org_name: str) -> dict:
     }
 
 
-async def provision_agent(org_id: str, retell_agent_id: str) -> dict:
+async def provision_agent(
+    org_id: str, retell_agent_id: str, boosted_keywords: list[str] | None = None
+) -> dict:
     """Point a Retell agent's Custom LLM URL and webhook URL at this backend.
 
     Returns the updated agent config plus the URLs we set. Raises
@@ -166,6 +172,9 @@ async def provision_agent(org_id: str, retell_agent_id: str) -> dict:
         "response_engine": {"type": "custom-llm", "llm_websocket_url": llm_websocket_url},
         "webhook_url": webhook_url,
     }
+    if boosted_keywords:
+        # ASR keyword boost (see knowledge_base_service.build_boosted_keywords).
+        payload["boosted_keywords"] = boosted_keywords
     url = f"{RETELL_API_BASE}/update-agent/{retell_agent_id}"
 
     logger.info(

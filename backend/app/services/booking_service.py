@@ -21,6 +21,10 @@ logger = structlog.get_logger()
 
 DEFAULT_SERVICE_DURATION_MINUTES = 30
 SLOTS_LOOKAHEAD_DAYS = 7
+# Slot suggestions span multiple open days (rather than dumping one day's whole
+# schedule) so the customer can see several days/times are available.
+MAX_SUGGESTED_DAYS = 3
+MAX_SUGGESTED_SLOTS = 6
 
 FALLBACK_MESSAGE = (
     "We're having trouble with booking right now — please call us directly and our team will "
@@ -44,7 +48,21 @@ def _format_time(dt: datetime) -> str:
 
 
 def _format_slot_options(slots: list[datetime]) -> str:
-    return ", ".join(f"{slot.strftime('%a')} {_format_time(slot)}" for slot in slots)
+    # Include the date (e.g. "Tue Aug 11 at 10:30 AM") so "Tuesday" is never
+    # ambiguous between this week and next.
+    return ", ".join(f"{slot.strftime('%a %b %d')} at {_format_time(slot)}" for slot in slots)
+
+
+def _spread_pick(slots: list[datetime], n: int) -> list[datetime]:
+    """Pick up to `n` slots spread evenly across a day's openings, so a day's
+    suggestions show e.g. a morning and an afternoon option rather than two
+    adjacent morning slots."""
+    if n <= 0:
+        return []
+    if len(slots) <= n:
+        return slots
+    step = len(slots) / n
+    return [slots[int(i * step)] for i in range(n)]
 
 
 def _parse_slot_datetime(date_str: str, time_str: str, org_timezone) -> datetime | None:
@@ -95,16 +113,34 @@ async def _extract_contact_info(db: AsyncSession, org_id: uuid.UUID, message_tex
 async def _next_available_slots(
     db: AsyncSession, org_id: uuid.UUID, duration_minutes: int, org_tz, *, start_day: date | None = None
 ) -> list[datetime]:
-    """Looks ahead up to SLOTS_LOOKAHEAD_DAYS for the first day with openings —
-    a fresh org's calendar might have nothing open today (closed, fully
-    booked), and offering nothing is a worse experience than checking the
-    next few days automatically."""
+    """A spread of open slots across the next few OPEN days (up to
+    SLOTS_LOOKAHEAD_DAYS ahead), so the customer sees that multiple days and
+    times are available rather than one day's whole schedule. Closed/fully
+    booked days are skipped. When only one day is open, it still returns a good
+    morning-to-afternoon spread from that day."""
     day = start_day or datetime.now(org_tz).date()
+
+    open_days: list[list[datetime]] = []
     for offset in range(SLOTS_LOOKAHEAD_DAYS):
-        slots = await slot_manager.get_available_slots(db, org_id, day + timedelta(days=offset), duration_minutes)
-        if slots:
-            return slots
-    return []
+        day_slots = await slot_manager.get_available_slots(
+            db, org_id, day + timedelta(days=offset), duration_minutes, max_results=16
+        )
+        if day_slots:
+            open_days.append(day_slots)
+        if len(open_days) >= MAX_SUGGESTED_DAYS:
+            break
+
+    if not open_days:
+        return []
+
+    # Divide the suggestion budget across the open days found (≥1 each), so
+    # several open days → a couple of times each; a single open day → a fuller
+    # spread from that one day.
+    per_day = max(1, MAX_SUGGESTED_SLOTS // len(open_days))
+    suggestions: list[datetime] = []
+    for day_slots in open_days:
+        suggestions.extend(_spread_pick(day_slots, per_day))
+    return suggestions[:MAX_SUGGESTED_SLOTS]
 
 
 async def booking_session_active(conversation_id: uuid.UUID) -> bool:

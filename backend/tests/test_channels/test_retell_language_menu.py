@@ -1,8 +1,15 @@
-"""Tests for the Retell voice-agent language-selection menu.
+"""Tests for the Retell voice-agent language handling.
 
-Covers the pure helper functions (_build_language_menu, _detect_language_choice,
-_lang_disclosure, _draft_begin_message) and the stateful routing logic in
-_CallState — no live WebSocket or database required.
+The flow is intro-first: every caller hears the AI disclosure + greeting at call
+open (in the org's default language), and multi-language orgs additionally hear a
+one-line invitation to switch language. The IVR-style language menu is presented
+ON DEMAND only, when a caller actually asks to switch (see
+_is_language_switch_request / _present_language_menu). Once shown, the caller's
+choice switches the language for the rest of the call with a short confirmation —
+no re-introduction.
+
+Covers the pure helpers and the stateful routing logic in _CallState — no live
+WebSocket or database required.
 """
 
 import asyncio
@@ -16,10 +23,15 @@ from app.channels.voice.retell_handler import (
     _detect_language_choice,
     _draft_begin_message,
     _handle_language_selection,
+    _is_language_switch_request,
     _lang_disclosure,
     _lang_instruction,
     _language_fallback,
+    _menu_prompt,
+    _present_language_menu,
+    _resume_line,
     _run_language_menu_timeout,
+    _switch_invite,
 )
 
 
@@ -133,6 +145,63 @@ class TestDetectLanguageChoice:
         assert _detect_language_choice("press 1 please", ["en", "nl"]) == "en"
 
 
+# ── _is_language_switch_request ───────────────────────────────────────────────
+
+
+class TestIsLanguageSwitchRequest:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "can I change the language?",
+            "switch language please",
+            "do you have another language",
+            "I want a different language",
+            "what are the language options",
+            "show me the language menu",
+            "do you speak French?",
+            "can we speak Spanish",
+            "can you continue in Dutch",
+            "I prefer German",
+        ],
+    )
+    def test_positive_requests(self, text):
+        assert _is_language_switch_request(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "I want to book an appointment",
+            "what are your opening hours",
+            "how much does a cleaning cost",
+            "can I speak to a human",
+            "yes that works for me",
+            "my name is John",
+            "",
+        ],
+    )
+    def test_negative_requests_do_not_trip(self, text):
+        assert _is_language_switch_request(text) is False
+
+
+# ── switch-text accessors ─────────────────────────────────────────────────────
+
+
+class TestSwitchTextAccessors:
+    def test_english_invite_mentions_language(self):
+        assert "language" in _switch_invite("en").lower()
+
+    def test_dutch_menu_prompt_is_dutch(self):
+        assert "taal" in _menu_prompt("nl").lower()
+
+    def test_french_resume_is_french(self):
+        assert "aider" in _resume_line("fr").lower()
+
+    def test_unknown_language_falls_back_to_english(self):
+        assert _switch_invite("xx") == _switch_invite("en")
+        assert _menu_prompt("xx") == _menu_prompt("en")
+        assert _resume_line("xx") == _resume_line("en")
+
+
 # ── _lang_disclosure ──────────────────────────────────────────────────────────
 
 
@@ -180,7 +249,6 @@ class TestLangInstruction:
 
 class TestDraftBeginMessage:
     def _org(self, name="Acme Clinic", system_prompts=None):
-        from unittest.mock import MagicMock
         org = MagicMock()
         org.name = name
         org.system_prompts = system_prompts or {}
@@ -229,20 +297,14 @@ class TestCallStateLanguageDefaults:
         state = _CallState()
         assert state.org_supported_languages == ["en"]
 
-    def test_single_language_org_does_not_need_menu(self):
-        """When org has one language, language_phase should never be set to
-        True by the websocket handler — verify the state machine invariant."""
-        state = _CallState()
-        state.org_supported_languages = ["en"]
-        # The websocket sets language_phase = len(supported) > 1
-        state.language_phase = len(state.org_supported_languages) > 1
-        assert state.language_phase is False
-
-    def test_three_language_org_triggers_menu_phase(self):
+    def test_language_phase_is_not_set_at_open_regardless_of_language_count(self):
+        """Intro-first flow: the menu is on-demand, so a multi-language org does
+        NOT enter language_phase at call open — the caller can just start talking."""
         state = _CallState()
         state.org_supported_languages = ["en", "nl", "fr"]
-        state.language_phase = len(state.org_supported_languages) > 1
-        assert state.language_phase is True
+        # Nothing in the open path flips this now; it's only set by
+        # _present_language_menu when the caller asks to switch.
+        assert state.language_phase is False
 
     def test_language_timeout_task_defaults_to_none(self):
         state = _CallState()
@@ -266,6 +328,60 @@ class TestLanguageFallback:
         assert _language_fallback(["de"]) == "de"
 
 
+# ── _present_language_menu ────────────────────────────────────────────────────
+
+
+class TestPresentLanguageMenu:
+    def _make_sender(self):
+        sender = MagicMock()
+        sender.send_shortcut = AsyncMock()
+        return sender
+
+    @pytest.mark.asyncio
+    async def test_presents_menu_sets_phase_and_arms_timer(self):
+        sender = self._make_sender()
+        state = _CallState()
+        state.org_supported_languages = ["en", "nl", "fr"]
+        state.selected_language = "en"
+
+        with patch(
+            "app.channels.voice.retell_handler.asyncio.create_task",
+            return_value=MagicMock(),
+        ) as create_task, patch(
+            "app.channels.voice.retell_handler._run_language_menu_timeout",
+            new=MagicMock(),
+        ):
+            await _present_language_menu(sender, state, response_id=7)
+
+        assert state.language_phase is True
+        assert state.language_timeout_task is not None
+        create_task.assert_called_once()
+        sender.send_shortcut.assert_awaited_once()
+        text = sender.send_shortcut.call_args[0][1]
+        # The current-language lead-in and each option are all present.
+        assert _menu_prompt("en") in text
+        assert "English" in text and "Nederlands" in text and "français" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_menu_prompt_is_in_current_language(self):
+        sender = self._make_sender()
+        state = _CallState()
+        state.org_supported_languages = ["nl", "en", "fr"]
+        state.selected_language = "nl"  # caller is currently in Dutch
+
+        with patch(
+            "app.channels.voice.retell_handler.asyncio.create_task",
+            return_value=MagicMock(),
+        ), patch(
+            "app.channels.voice.retell_handler._run_language_menu_timeout",
+            new=MagicMock(),
+        ):
+            await _present_language_menu(sender, state, response_id=1)
+
+        text = sender.send_shortcut.call_args[0][1]
+        assert _menu_prompt("nl") in text  # Dutch lead-in
+
+
 # ── _run_language_menu_timeout ────────────────────────────────────────────────
 
 
@@ -275,56 +391,39 @@ class TestRunLanguageMenuTimeout:
         sender.send_shortcut = AsyncMock()
         return sender
 
-    def _make_state(self, languages=None):
+    def _make_state(self, languages=None, current=None):
         state = _CallState()
         state.org_supported_languages = languages or ["en", "nl", "fr"]
         state.language_phase = True
-        state.selected_language = state.org_supported_languages[0]
+        state.selected_language = current or state.org_supported_languages[0]
         return state
 
     @pytest.mark.asyncio
-    async def test_timeout_defaults_to_english_after_delay(self):
+    async def test_timeout_resumes_current_language_and_clears_phase(self):
+        """On silence the switch is abandoned: stay in the CURRENT language and
+        speak a short resume line (no re-introduction, no language change)."""
         sender = self._make_sender()
-        state = self._make_state(["en", "nl", "fr"])
-        org = MagicMock()
-        org.name = "Test Clinic"
-        org.system_prompts = {}
+        state = self._make_state(["en", "nl", "fr"], current="nl")
 
         with patch("app.channels.voice.retell_handler.asyncio.sleep", new_callable=AsyncMock):
-            await _run_language_menu_timeout(sender, __import__("uuid").uuid4(), "call-1", state, {}, org)
+            await _run_language_menu_timeout(sender, state)
 
-        assert state.selected_language == "en"
         assert state.language_phase is False
+        assert state.selected_language == "nl"  # unchanged
         sender.send_shortcut.assert_awaited_once()
-        # The message sent should contain the English disclosure
         sent_text = sender.send_shortcut.call_args[0][1]
-        assert "AI assistant" in sent_text
+        assert sent_text == _resume_line("nl")
 
     @pytest.mark.asyncio
-    async def test_timeout_falls_back_to_first_language_when_no_english(self):
-        sender = self._make_sender()
-        state = self._make_state(["nl", "fr"])
-        org = MagicMock()
-        org.name = "Kliniek"
-        org.system_prompts = {}
-
-        with patch("app.channels.voice.retell_handler.asyncio.sleep", new_callable=AsyncMock):
-            await _run_language_menu_timeout(sender, __import__("uuid").uuid4(), "call-2", state, {}, org)
-
-        assert state.selected_language == "nl"
-        assert state.language_phase is False
-
-    @pytest.mark.asyncio
-    async def test_timeout_no_op_when_language_already_resolved(self):
+    async def test_timeout_no_op_when_already_resolved(self):
         """If the caller selected a language before the timer fired, the
         timeout task should return without sending anything."""
         sender = self._make_sender()
-        state = self._make_state()
+        state = self._make_state(current="fr")
         state.language_phase = False  # already resolved
-        state.selected_language = "fr"
 
         with patch("app.channels.voice.retell_handler.asyncio.sleep", new_callable=AsyncMock):
-            await _run_language_menu_timeout(sender, __import__("uuid").uuid4(), "call-3", state, {}, None)
+            await _run_language_menu_timeout(sender, state)
 
         sender.send_shortcut.assert_not_awaited()
         assert state.selected_language == "fr"  # unchanged
@@ -339,128 +438,140 @@ class TestRunLanguageMenuTimeout:
             raise asyncio.CancelledError
 
         with patch("app.channels.voice.retell_handler.asyncio.sleep", side_effect=raise_cancelled):
-            await _run_language_menu_timeout(sender, __import__("uuid").uuid4(), "call-4", state, {}, None)
+            await _run_language_menu_timeout(sender, state)
 
         sender.send_shortcut.assert_not_awaited()
         # language_phase must not have been changed by the cancelled task
         assert state.language_phase is True
 
 
-# ── _handle_language_selection default paths ──────────────────────────────────
+# ── _handle_language_selection ────────────────────────────────────────────────
 
 
-class TestHandleLanguageSelectionDefaults:
+class TestHandleLanguageSelection:
     def _make_sender(self):
         sender = MagicMock()
         sender.send_shortcut = AsyncMock()
         return sender
 
-    def _make_state(self, languages=None):
+    def _make_state(self, languages=None, current=None):
         state = _CallState()
         state.org_supported_languages = languages or ["en", "nl", "fr"]
         state.language_phase = True
-        state.selected_language = (languages or ["en", "nl", "fr"])[0]
+        state.selected_language = current or state.org_supported_languages[0]
         return state
 
-    def _org(self, name="Acme"):
-        org = MagicMock()
-        org.name = name
-        org.system_prompts = {}
-        return org
-
     @pytest.mark.asyncio
-    async def test_invalid_input_defaults_to_english(self):
-        """Unrecognised DTMF / speech must default to English, not re-present menu."""
+    async def test_valid_choice_switches_and_confirms_in_new_language(self):
         sender = self._make_sender()
-        state = self._make_state(["en", "nl", "fr"])
-        transcript = [{"role": "user", "content": "bleep bloop"}]
+        state = self._make_state(["en", "nl", "fr"], current="en")
+        transcript = [{"role": "user", "content": "français"}]
 
         with patch("app.channels.voice.retell_handler.async_session_maker"), \
              patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
-             patch("app.channels.voice.retell_handler.get_conversation_messages", new_callable=AsyncMock, return_value=[]):
-            await _handle_language_selection(sender, __import__("uuid").uuid4(), "call-5", 1, transcript, state, {}, self._org())
+             patch("app.channels.voice.retell_handler.add_message", new_callable=AsyncMock):
+            await _handle_language_selection(
+                sender, __import__("uuid").uuid4(), "call-1", 1, transcript, state
+            )
 
-        assert state.selected_language == "en"
+        assert state.selected_language == "fr"
         assert state.language_phase is False
         sender.send_shortcut.assert_awaited_once()
+        assert sender.send_shortcut.call_args[0][1] == _resume_line("fr")
 
     @pytest.mark.asyncio
-    async def test_empty_transcript_defaults_to_english(self):
-        """Empty transcript (reminder_required silence path) must also default."""
+    async def test_valid_choice_persists_confirmation_message(self):
         sender = self._make_sender()
-        state = self._make_state(["en", "nl"])
+        state = self._make_state(["en", "nl"], current="en")
+        transcript = [{"role": "user", "content": "Nederlands"}]
 
         with patch("app.channels.voice.retell_handler.async_session_maker"), \
              patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
-             patch("app.channels.voice.retell_handler.get_conversation_messages", new_callable=AsyncMock, return_value=[]):
-            await _handle_language_selection(sender, __import__("uuid").uuid4(), "call-6", 1, [], state, {}, self._org())
+             patch("app.channels.voice.retell_handler.add_message", new_callable=AsyncMock) as add_msg:
+            await _handle_language_selection(
+                sender, __import__("uuid").uuid4(), "call-2", 1, transcript, state
+            )
 
-        assert state.selected_language == "en"
+        assert state.selected_language == "nl"
+        add_msg.assert_awaited_once()  # the resume confirmation is saved
+
+    @pytest.mark.asyncio
+    async def test_invalid_input_keeps_current_language(self):
+        """Unrecognised speech must NOT switch or loop the menu — stay put and
+        speak a brief resume in the current language."""
+        sender = self._make_sender()
+        state = self._make_state(["en", "nl", "fr"], current="en")
+        transcript = [{"role": "user", "content": "bleep bloop"}]
+
+        await _handle_language_selection(
+            sender, __import__("uuid").uuid4(), "call-3", 1, transcript, state
+        )
+
+        assert state.selected_language == "en"  # unchanged
         assert state.language_phase is False
+        sender.send_shortcut.assert_awaited_once()
+        assert sender.send_shortcut.call_args[0][1] == _resume_line("en")
 
     @pytest.mark.asyncio
-    async def test_invalid_input_no_english_defaults_to_first_language(self):
-        """When English is not in the org's list, fallback is the first language."""
+    async def test_empty_transcript_keeps_current_language(self):
+        """Empty transcript (reminder_required silence path) keeps current lang."""
         sender = self._make_sender()
-        state = self._make_state(["nl", "fr"])
-        transcript = [{"role": "user", "content": "xyz"}]
+        state = self._make_state(["nl", "fr"], current="nl")
 
-        with patch("app.channels.voice.retell_handler.async_session_maker"), \
-             patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
-             patch("app.channels.voice.retell_handler.get_conversation_messages", new_callable=AsyncMock, return_value=[]):
-            await _handle_language_selection(sender, __import__("uuid").uuid4(), "call-7", 1, transcript, state, {}, self._org())
+        await _handle_language_selection(
+            sender, __import__("uuid").uuid4(), "call-4", 1, [], state
+        )
 
         assert state.selected_language == "nl"
         assert state.language_phase is False
+        assert sender.send_shortcut.call_args[0][1] == _resume_line("nl")
 
     @pytest.mark.asyncio
     async def test_already_resolved_returns_early(self):
         """If language_phase is False (concurrent task already handled it),
         _handle_language_selection must be a no-op."""
         sender = self._make_sender()
-        state = self._make_state()
+        state = self._make_state(current="fr")
         state.language_phase = False
-        state.selected_language = "fr"
 
-        await _handle_language_selection(sender, __import__("uuid").uuid4(), "call-8", 1, [], state, {}, self._org())
+        await _handle_language_selection(
+            sender, __import__("uuid").uuid4(), "call-5", 1, [], state
+        )
 
         sender.send_shortcut.assert_not_awaited()
         assert state.selected_language == "fr"  # untouched
 
     @pytest.mark.asyncio
     async def test_valid_choice_cancels_timeout_task(self):
-        """A valid language selection must cancel the pending timeout task."""
         sender = self._make_sender()
-        state = self._make_state(["en", "nl"])
-        # Simulate an in-flight timeout task
+        state = self._make_state(["en", "nl"], current="en")
         timeout_task = MagicMock()
         timeout_task.done.return_value = False
         state.language_timeout_task = timeout_task
-
-        transcript = [{"role": "user", "content": "English"}]
+        transcript = [{"role": "user", "content": "Nederlands"}]
 
         with patch("app.channels.voice.retell_handler.async_session_maker"), \
              patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
-             patch("app.channels.voice.retell_handler.get_conversation_messages", new_callable=AsyncMock, return_value=[]):
-            await _handle_language_selection(sender, __import__("uuid").uuid4(), "call-9", 1, transcript, state, {}, self._org())
+             patch("app.channels.voice.retell_handler.add_message", new_callable=AsyncMock):
+            await _handle_language_selection(
+                sender, __import__("uuid").uuid4(), "call-6", 1, transcript, state
+            )
 
         timeout_task.cancel.assert_called_once()
-        assert state.selected_language == "en"
+        assert state.selected_language == "nl"
 
     @pytest.mark.asyncio
     async def test_invalid_input_also_cancels_timeout_task(self):
-        """Even when defaulting due to bad input the timeout task must be cancelled."""
         sender = self._make_sender()
-        state = self._make_state(["en", "nl"])
+        state = self._make_state(["en", "nl"], current="en")
         timeout_task = MagicMock()
         timeout_task.done.return_value = False
         state.language_timeout_task = timeout_task
-
         transcript = [{"role": "user", "content": "gibberish"}]
 
-        with patch("app.channels.voice.retell_handler.async_session_maker"), \
-             patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
-             patch("app.channels.voice.retell_handler.get_conversation_messages", new_callable=AsyncMock, return_value=[]):
-            await _handle_language_selection(sender, __import__("uuid").uuid4(), "call-10", 1, transcript, state, {}, self._org())
+        await _handle_language_selection(
+            sender, __import__("uuid").uuid4(), "call-7", 1, transcript, state
+        )
 
         timeout_task.cancel.assert_called_once()
+        assert state.selected_language == "en"  # unchanged

@@ -32,8 +32,13 @@ from app.config import settings
 from app.security.encryption import decrypt_api_key
 from app.security.rate_limiter import check_message_rate_limit, increment_message_count
 from app.security.webhook_verify import verify_retell_signature
-from app.services.booking_service import booking_session_active, process_booking_intent
-from app.services.conversation_service import STATIC_RATE_LIMIT_MESSAGE, add_message, get_conversation_messages
+from app.services.booking_service import booking_session_active, clear_booking_session, process_booking_intent
+from app.services.conversation_service import (
+    STATIC_RATE_LIMIT_MESSAGE,
+    add_message,
+    create_escalation,
+    get_conversation_messages,
+)
 
 logger = structlog.get_logger()
 
@@ -49,6 +54,55 @@ _BOOKING_TRIGGER_RE = re.compile(
 
 def _is_booking_trigger(text: str) -> bool:
     return bool(_BOOKING_TRIGGER_RE.search(text or ""))
+
+
+# Explicit "get me a human" detector — same rationale as the booking trigger:
+# voice skips the analyze_message intent call, so escalation intent is detected
+# with a cheap regex, not an LLM call. Deliberately conservative (requires an
+# action verb + a human noun, or "real/live person") to avoid false escalations
+# that would wrongly stop the AI from helping.
+_ESCALATION_TRIGGER_RE = re.compile(
+    r"\b(speak|talk|connect|transfer|put me through)\b[^.?!]{0,30}\b(human|person|someone|agent|representative|rep|staff|manager|team)\b"
+    r"|\b(real|actual|live)\s+(person|human|agent)\b"
+    r"|\b(get me|need|want)\b[^.?!]{0,15}\b(human|agent|representative)\b",
+    re.IGNORECASE,
+)
+
+# Spoken acknowledgement when a caller asks for a human. Voice can't do a live
+# transfer, so this records the escalation + alerts staff for follow-up while the
+# AI stays on the line. Org-agnostic wording (no hardcoded business name).
+VOICE_ESCALATION_REPLY = (
+    "Of course. I've passed this along to our team and someone will reach out to you shortly. "
+    "Is there anything else I can help you with in the meantime?"
+)
+
+
+def _is_escalation_trigger(text: str) -> bool:
+    return bool(_ESCALATION_TRIGGER_RE.search(text or ""))
+
+
+# On-demand language switch — the intro-first flow no longer opens with the IVR
+# language menu; the caller hears an introduction and is told they can switch
+# language. This detects that request so the menu is presented only when asked.
+# Deterministic (regex, no LLM call) to fit the voice latency budget, same as the
+# booking/escalation triggers. Two shapes: an explicit "…language" request, or
+# naming a language after a switch-context verb ("do you speak French", "in
+# Dutch"). Only ever consulted for multi-language orgs.
+_LANGUAGE_SWITCH_RE = re.compile(
+    r"\b(?:change|switch|different|other|another|pick|choose|select)\b[^.?!]{0,25}\blanguages?\b"
+    r"|\blanguages?\b[^.?!]{0,25}\b(?:option|options|menu|choices?|list|settings?)\b"
+    r"|\bother\s+languages?\b"
+    r"|\b(?:speak|spoken|talk|say(?:\sit)?|prefer|understand|continue|switch\sto|change\sto|in|have|got)\b"
+    r"[^.?!]{0,15}\b(?:english|french|fran[cç]ais|spanish|espa[nñ]ol|dutch|nederlands|german|deutsch|"
+    r"italian|italiano|portuguese|portugu[eê]s|arabic|turkish|t[uü]rk[cç]e|urdu|hindi|"
+    r"chinese|mandarin|russian|polski|polish|japanese)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_language_switch_request(text: str) -> bool:
+    return bool(_LANGUAGE_SWITCH_RE.search(text or ""))
+
 
 # Patterns for extracting the caller's name from voice transcripts.
 #
@@ -333,6 +387,74 @@ def _language_fallback(supported: list[str]) -> str:
     first configured language rather than refusing to proceed.
     """
     return "en" if "en" in supported else supported[0]
+
+
+# On-demand language-switch phrasing (intro-first flow). Kept in a parallel dict
+# so the primary _LANG_INFO menu/disclosure/keyword data stays untouched.
+#   switch_invite — one-line offer appended to the opening greeting, spoken in the
+#                   org's default language ("you can switch language anytime").
+#   menu_prompt   — lead-in spoken in the CURRENT language right before the menu,
+#                   when a caller actually asks to change language.
+#   resume        — short confirmation spoken in the NEW language after a switch
+#                   (the caller was already introduced/disclosed at call start,
+#                   so we don't repeat the full greeting).
+_LANG_SWITCH_TEXT: dict[str, dict[str, str]] = {
+    "en": {"switch_invite": "You can also switch language at any time — just ask.",
+           "menu_prompt": "Sure — which language would you like?",
+           "resume": "Great. How can I help you?"},
+    "nl": {"switch_invite": "U kunt ook op elk moment van taal wisselen — vraag er gerust naar.",
+           "menu_prompt": "Natuurlijk — welke taal wilt u?",
+           "resume": "Prima. Hoe kan ik u helpen?"},
+    "fr": {"switch_invite": "Vous pouvez aussi changer de langue à tout moment — demandez simplement.",
+           "menu_prompt": "Bien sûr — quelle langue souhaitez-vous ?",
+           "resume": "Parfait. Comment puis-je vous aider ?"},
+    "de": {"switch_invite": "Sie können jederzeit die Sprache wechseln — fragen Sie einfach.",
+           "menu_prompt": "Natürlich — welche Sprache möchten Sie?",
+           "resume": "Sehr gut. Wie kann ich Ihnen helfen?"},
+    "es": {"switch_invite": "También puede cambiar de idioma en cualquier momento — solo pídalo.",
+           "menu_prompt": "Claro — ¿qué idioma prefiere?",
+           "resume": "Perfecto. ¿En qué puedo ayudarle?"},
+    "it": {"switch_invite": "Può anche cambiare lingua in qualsiasi momento — basta chiedere.",
+           "menu_prompt": "Certo — quale lingua preferisce?",
+           "resume": "Perfetto. Come posso aiutarla?"},
+    "pt": {"switch_invite": "Também pode mudar de idioma a qualquer momento — é só pedir.",
+           "menu_prompt": "Claro — que idioma prefere?",
+           "resume": "Ótimo. Como posso ajudá-lo?"},
+    "ar": {"switch_invite": "يمكنك أيضًا تغيير اللغة في أي وقت — فقط اطلب ذلك.",
+           "menu_prompt": "بالطبع — ما اللغة التي تفضلها؟",
+           "resume": "رائع. كيف يمكنني مساعدتك؟"},
+    "tr": {"switch_invite": "İstediğiniz zaman dili de değiştirebilirsiniz — sadece söyleyin.",
+           "menu_prompt": "Tabii — hangi dili istersiniz?",
+           "resume": "Harika. Size nasıl yardımcı olabilirim?"},
+    "ur": {"switch_invite": "آپ کسی بھی وقت زبان بھی تبدیل کر سکتے ہیں — بس کہہ دیں۔",
+           "menu_prompt": "ضرور — آپ کون سی زبان چاہتے ہیں؟",
+           "resume": "بہت اچھا۔ میں آپ کی کیسے مدد کر سکتا ہوں؟"},
+    "hi": {"switch_invite": "आप किसी भी समय भाषा भी बदल सकते हैं — बस कहिए।",
+           "menu_prompt": "ज़रूर — आप कौन सी भाषा चाहते हैं?",
+           "resume": "बढ़िया। मैं आपकी कैसे मदद कर सकता हूँ?"},
+    "zh": {"switch_invite": "您也可以随时切换语言——只需告诉我。",
+           "menu_prompt": "当然——您想要哪种语言？",
+           "resume": "好的。有什么可以帮您？"},
+    "ru": {"switch_invite": "Вы также можете сменить язык в любой момент — просто скажите.",
+           "menu_prompt": "Конечно — какой язык вы хотите?",
+           "resume": "Отлично. Чем я могу помочь?"},
+    "pl": {"switch_invite": "Możesz też w każdej chwili zmienić język — wystarczy poprosić.",
+           "menu_prompt": "Oczywiście — jaki język Pan/Pani wybiera?",
+           "resume": "Świetnie. Jak mogę pomóc?"},
+}
+
+
+def _switch_invite(language: str) -> str:
+    return _LANG_SWITCH_TEXT.get(language, _LANG_SWITCH_TEXT["en"])["switch_invite"]
+
+
+def _menu_prompt(language: str) -> str:
+    return _LANG_SWITCH_TEXT.get(language, _LANG_SWITCH_TEXT["en"])["menu_prompt"]
+
+
+def _resume_line(language: str) -> str:
+    return _LANG_SWITCH_TEXT.get(language, _LANG_SWITCH_TEXT["en"])["resume"]
+
 
 # Codes in the 4000-4999 range are reserved for application use per RFC 6455.
 WS_CLOSE_VOICE_NOT_CONFIGURED = 4404
@@ -632,11 +754,10 @@ async def _persist_customer_message(conversation_id: uuid.UUID, message_text: st
 
 
 def _draft_begin_message(config: dict, org: "Organization | None", language: str = "en") -> str:
-    """Build the opening utterance spoken right after the config frame.
-
-    For single-language orgs this is the first thing the caller hears.
-    For multi-language orgs it is spoken AFTER the language-selection menu,
-    so the disclosure is in the caller's chosen language.
+    """Build the opening utterance spoken right after the config frame — the
+    first thing every caller hears, in the org's default language. Multi-language
+    orgs additionally get a one-line switch-language invitation appended by the
+    caller (see the call-open block); the menu itself is on-demand, not up front.
 
     The AI-identity disclosure (AI Act Art. 50) is unconditionally prepended
     and is NOT overridable via org config — it is a legal requirement.
@@ -834,27 +955,41 @@ async def _maybe_update_contact_name(
 # ---------------------------------------------------------------------------
 
 
+async def _present_language_menu(sender: _Sender, state: _CallState, response_id: int | None) -> None:
+    """Speak the on-demand language menu: a short lead-in in the caller's current
+    language, then one option line per supported language (each in its own
+    language). Flips the call into `language_phase` so the caller's next turn is
+    parsed as a menu choice, and arms the silence safety-net timer.
+
+    Unlike the old call-open menu, this is reached only when a caller explicitly
+    asks to switch language, so no disclosure is (re)spoken — that already went
+    out with the opening greeting."""
+    prompt = _menu_prompt(state.selected_language)
+    menu = _build_language_menu(state.org_supported_languages)
+    state.language_phase = True
+    # Leading space: this closes an utterance already opened by the turn's filler
+    # frame (same response_id), and Retell concatenates content frames verbatim.
+    await sender.send_shortcut(response_id, f" {prompt} {menu}")
+    # Arm the silence safety-net. Held on state so it isn't GC'd and can be
+    # cancelled the moment a selection arrives.
+    state.language_timeout_task = asyncio.create_task(
+        _run_language_menu_timeout(sender, state)
+    )
+
+
 async def _run_language_menu_timeout(
     sender: _Sender,
-    org_id: uuid.UUID,
-    call_id: str,
     state: _CallState,
-    config: dict,
-    org: "Organization | None",
     delay: float = 5.5,
 ) -> None:
-    """Safety-net: auto-default to the fallback language after `delay` seconds
-    of silence on the language-selection menu.
+    """Safety-net: if the caller goes silent on the on-demand language menu for
+    `delay` seconds, quietly abandon the switch and resume in the CURRENT
+    language rather than looping the menu.
 
-    This fires when the caller doesn't respond at all (dead phone, confusion,
-    background noise that prevents Retell from triggering reminder_required in
-    time).  The `reminder_required` path in the WebSocket loop handles the more
-    common case where Retell detects silence and notifies us; this task is the
-    belt-and-suspenders backup.
-
-    The 5.5 s default should be set close to (but slightly longer than) the
-    Retell agent's own silence-detection threshold so the two paths don't race
-    unnecessarily.
+    Fires when the caller doesn't respond at all (confusion, background noise
+    that stops Retell triggering reminder_required in time). The
+    `reminder_required` path in the WebSocket loop handles the common case where
+    Retell detects silence and notifies us; this task is the backup.
     """
     try:
         await asyncio.sleep(delay)
@@ -864,22 +999,9 @@ async def _run_language_menu_timeout(
     if not state.language_phase:
         return  # Already resolved by response_required or reminder_required.
 
-    fallback = _language_fallback(state.org_supported_languages)
-    logger.info(
-        "language_menu_defaulted",
-        org_id=str(org_id),
-        call_id=call_id,
-        reason="timeout",
-        fallback=fallback,
-    )
-    state.selected_language = fallback
     state.language_phase = False
-
-    begin_message = _draft_begin_message(config, org, language=fallback)
-    # No response_required is in flight — send as a spontaneous agent
-    # utterance (response_id=None).  Retell accepts proactive sends.
-    await sender.send_shortcut(None, begin_message)
-    logger.info("ai_disclosure_sent", org_id=str(org_id), channel="voice", call_id=call_id, language=fallback)
+    # No response_required is in flight — send as a spontaneous agent utterance.
+    await sender.send_shortcut(None, _resume_line(state.selected_language))
 
 
 async def _handle_language_selection(
@@ -889,18 +1011,17 @@ async def _handle_language_selection(
     response_id: int | None,
     transcript: list[dict],
     state: _CallState,
-    config: dict,
-    org: "Organization | None",
 ) -> None:
-    """Handle the first caller turn when a language-selection menu was presented.
+    """Resolve the caller's choice on the on-demand language menu.
 
-    On a clear choice: speak the AI disclosure + org greeting in the selected
-    language, persist that message to the conversation, and clear language_phase
-    so all subsequent response_required events take the normal _handle_turn path.
+    On a clear choice: switch `selected_language` (all later turns get that
+    language's system-prompt instruction), clear language_phase, and speak a
+    short confirmation in the NEW language. The caller was already introduced +
+    AI-disclosed at call open, so we deliberately do NOT repeat the full greeting.
 
-    On an unclear response or silence (timeout path via reminder_required with
-    empty transcript): default to the fallback language rather than looping the
-    menu.  Log the event so we can see how often this happens.
+    On an unclear response or silence: keep the current language and speak a
+    brief resume line rather than looping the menu. Log it so we can see how
+    often callers mis-hit the menu.
     """
     if not state.language_phase:
         return  # Concurrent timeout task already resolved this.
@@ -909,50 +1030,42 @@ async def _handle_language_selection(
     user_input = (user_turns[-1].get("content") or "").strip() if user_turns else ""
 
     chosen = _detect_language_choice(user_input, state.org_supported_languages)
+
+    # Cancel the safety-net timer — the menu is resolved either way now.
+    if state.language_timeout_task and not state.language_timeout_task.done():
+        state.language_timeout_task.cancel()
+    state.language_phase = False
+
     if chosen is None:
-        fallback = _language_fallback(state.org_supported_languages)
-        # Distinguish caller silence (empty transcript → reminder_required path)
-        # from audible-but-unrecognised input (response_required with speech).
+        # Silence (empty transcript via reminder_required) or audible-but-
+        # unrecognised input: stay in the current language, don't loop the menu.
         reason = "timeout" if not user_input else "invalid_input"
         logger.info(
-            "language_menu_defaulted",
+            "language_menu_unresolved",
             org_id=str(org_id),
             call_id=call_id,
             reason=reason,
-            fallback=fallback,
+            language=state.selected_language,
         )
-        chosen = fallback
-
-    # Cancel the safety-net timer whether we got a valid choice or defaulted —
-    # language is now resolved and the timer is no longer needed.
-    if state.language_timeout_task and not state.language_timeout_task.done():
-        state.language_timeout_task.cancel()
+        await sender.send_shortcut(response_id, _resume_line(state.selected_language))
+        return
 
     state.selected_language = chosen
-    state.language_phase = False
-
-    begin_message = _draft_begin_message(config, org, language=chosen)
-    await sender.send_shortcut(response_id, begin_message)
+    resume = _resume_line(chosen)
+    await sender.send_shortcut(response_id, resume)
     logger.info(
-        "ai_disclosure_sent",
+        "language_switched",
         org_id=str(org_id),
         channel="voice",
         call_id=call_id,
         language=chosen,
     )
 
-    # Persist the disclosure+greeting as the first AI message in this
-    # conversation.  The menu text was intentionally NOT persisted — it is a
-    # UI interaction, not part of the customer-facing conversation history.
+    # Persist the confirmation as an AI message so the switch shows in history.
+    # The menu text and the caller's one-word choice are UI plumbing, not saved.
     conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
-    if not state.greeting_saved:
-        async with state.conversation_lock:
-            if not state.greeting_saved:
-                async with async_session_maker() as db:
-                    existing = await get_conversation_messages(db, conversation_id)
-                    if not existing:
-                        await add_message(db, conversation_id, MessageRole.ai, begin_message, Channel.voice)
-                state.greeting_saved = True
+    async with async_session_maker() as db:
+        await add_message(db, conversation_id, MessageRole.ai, resume, Channel.voice)
 
 
 async def _run_language_selection(
@@ -962,15 +1075,13 @@ async def _run_language_selection(
     response_id: int | None,
     transcript: list[dict],
     state: _CallState,
-    config: dict,
-    org: "Organization | None",
 ) -> None:
     """Thin wrapper around _handle_language_selection — mirrors _run_turn's
     pattern so CancelledError propagates and other exceptions are logged rather
     than silently swallowed by the fire-and-forget task mechanism."""
     try:
         await _handle_language_selection(
-            sender, org_id, call_id, response_id, transcript, state, config, org
+            sender, org_id, call_id, response_id, transcript, state
         )
     except asyncio.CancelledError:
         logger.info("voice_ws_lang_select_cancelled", org_id=str(org_id), call_id=call_id)
@@ -1140,6 +1251,38 @@ async def _handle_turn(
         call_id=call_id,
         latency_ms=round((time.monotonic() - ratelimit_start) * 1000),
     )
+
+    # ── Escalation fast path ──────────────────────────────────────────────────
+    # Explicit "get me a human" → record an escalation + notify staff, then speak
+    # a canned acknowledgement. Deterministic (regex, no LLM call), so it fits the
+    # voice latency budget. Checked before booking so a caller mid-booking who
+    # asks for a person still escalates. Voice can't do a live transfer, so this
+    # flags it for human follow-up and the AI stays on the line meanwhile.
+    if _is_escalation_trigger(message_text):
+        await clear_booking_session(conversation_id)
+        async with async_session_maker() as db:
+            await create_escalation(db, org_id, conversation_id, reason=message_text)
+            await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
+            await add_message(
+                db, conversation_id, MessageRole.ai, f"{filler} {VOICE_ESCALATION_REPLY}", Channel.voice
+            )
+        await sender.send_chunk(response_id, " " + VOICE_ESCALATION_REPLY, content_complete=False)
+        await sender.send_chunk(response_id, "", content_complete=True)
+        logger.info("voice_escalation_created", org_id=str(org_id), call_id=call_id)
+        return
+
+    # ── Language-switch fast path ─────────────────────────────────────────────
+    # Multi-language orgs: the opening greeting invited the caller to switch
+    # language anytime. When they ask, present the on-demand menu (deterministic
+    # regex, no LLM) and flip into language_phase so their next turn is parsed as
+    # a choice. Checked before booking so "can you speak French?" mid-booking is
+    # honored — the booking session isn't cleared, so it resumes after the switch.
+    if len(state.org_supported_languages) > 1 and _is_language_switch_request(message_text):
+        await _present_language_menu(sender, state, response_id)
+        async with async_session_maker() as db:
+            await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
+        logger.info("voice_language_menu_shown", org_id=str(org_id), call_id=call_id)
+        return
 
     # ── Booking fast path ─────────────────────────────────────────────────────
     # Structured appointment booking runs through the same FSM as chat/WhatsApp.
@@ -1429,32 +1572,29 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
 
     # 2. Opening utterance — what the agent says first (response_id 0).
     #
-    #    Single-language org: speak the AI-disclosure + greeting immediately.
-    #    Multi-language org:  speak the language-selection menu instead; the
-    #    disclosure is deferred to _handle_language_selection so it can be
-    #    delivered in the caller's chosen language after they select.
+    #    Intro-first flow: EVERY caller now hears the AI-disclosure + greeting
+    #    immediately, in the org's default (first configured) language. We never
+    #    open with the IVR language menu — for multi-language orgs we instead
+    #    append a one-line invitation to switch language, and the menu is shown
+    #    on demand only when the caller actually asks (see _handle_turn's
+    #    language fast-path). This keeps the common case — a caller who speaks
+    #    the default language — free of an up-front menu they'd sit through.
+    opening = _draft_begin_message(config, org, language=supported_languages[0])
     if len(supported_languages) > 1:
-        opening = _build_language_menu(supported_languages)
-        state.language_phase = True
-        # The menu is not persisted as a conversation message — it is a UI
-        # interaction. Pass empty greeting to _run_call_details so it skips
-        # the message insert; _handle_language_selection saves the real greeting.
-        greeting = ""
-    else:
-        opening = _draft_begin_message(config, org, language=supported_languages[0])
-        greeting = opening
+        opening = f"{opening} {_switch_invite(supported_languages[0])}"
+    greeting = opening
 
     await sender.send(
         {"response_type": "response", "response_id": 0, "content": opening, "content_complete": True}
     )
 
-    if not state.language_phase:
-        logger.info(
-            "ai_disclosure_sent",
-            org_id=str(org_id),
-            channel="voice",
-            call_id=call_id,
-        )
+    logger.info(
+        "ai_disclosure_sent",
+        org_id=str(org_id),
+        channel="voice",
+        call_id=call_id,
+        language=supported_languages[0],
+    )
 
     # All slow work (DB / RAG / LLM) runs in background tasks so this loop never
     # blocks — Retell drops the call if ping_pong echoes stall for a few seconds.
@@ -1475,14 +1615,10 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
     state.llm_client_future = asyncio.get_running_loop().create_future()
     spawn(_prime_llm_client(state, org_id, call_id))
 
-    # Safety-net timer: if the caller doesn't respond to the language menu
-    # within 5.5 s, default to the fallback language automatically.
-    # The reminder_required path handles the more common silence case (Retell
-    # notifies us); this task fires even if Retell's VAD is fooled by noise.
-    if state.language_phase:
-        state.language_timeout_task = spawn(
-            _run_language_menu_timeout(sender, org_id, call_id, state, config, org)
-        )
+    # NB: the language-selection menu is no longer presented at call open — it
+    # appears on demand when a caller asks to switch language (see _handle_turn).
+    # The safety-net silence timer for it is therefore spawned at that point, not
+    # here.
 
     try:
         while True:
@@ -1538,14 +1674,14 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
             if interaction_type == "reminder_required":
                 response_id = event.get("response_id")
                 if state.language_phase:
-                    # Caller was silent during the language menu — Retell's own
-                    # silence detection fired before our asyncio timer.  Route
+                    # Caller was silent on the on-demand language menu — Retell's
+                    # own silence detection fired before our asyncio timer. Route
                     # through _run_language_selection with an empty transcript so
-                    # _handle_language_selection sees no user input and defaults
-                    # to the fallback language (logging reason="timeout").
+                    # _handle_language_selection sees no input and resumes in the
+                    # current language (logging reason="timeout").
                     spawn(
                         _run_language_selection(
-                            sender, org_id, call_id, response_id, [], state, config, org
+                            sender, org_id, call_id, response_id, [], state
                         )
                     )
                 else:
@@ -1571,11 +1707,11 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
                         await sender.send_response_close(active_response_id)
                 active_response_id = response_id
                 if state.language_phase:
-                    # Language-selection turn: parse the caller's choice and
-                    # either confirm + send disclosure or re-present the menu.
+                    # On-demand language menu is open: parse the caller's choice,
+                    # switch language + confirm, or resume the current language.
                     active_turn = spawn(
                         _run_language_selection(
-                            sender, org_id, call_id, response_id, transcript, state, config, org
+                            sender, org_id, call_id, response_id, transcript, state
                         )
                     )
                 else:
@@ -1595,7 +1731,11 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
         logger.exception("voice_ws_error", org_id=str(org_id), call_id=call_id, error=str(exc))
     finally:
         # Cancel any still-running turn/reminder/call_details tasks so they don't
-        # dangle after the socket is gone.
+        # dangle after the socket is gone. The on-demand language-menu timeout is
+        # created outside `background_tasks` (from a turn handler), so cancel it
+        # explicitly too — otherwise it could fire and send on a closed socket.
+        if state.language_timeout_task and not state.language_timeout_task.done():
+            state.language_timeout_task.cancel()
         for task in list(background_tasks):
             task.cancel()
         if background_tasks:
