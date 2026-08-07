@@ -56,6 +56,7 @@ from app.db.engine import async_session_maker
 from app.db.redis import redis_client
 from app.models.enums import Channel
 from app.services import contact_service, conversation_service
+from app.services.api_key_service import resolve_provider_key
 
 logger = structlog.get_logger()
 
@@ -248,7 +249,21 @@ async def handle_voice_note(
         # Both Groq and OpenAI Whisper accept ogg/opus natively. Converting to
         # WAV first (as the original code did) adds ~150-300ms latency and an
         # extra ffmpeg failure point with no quality benefit (gap #2).
-        stt = get_stt_provider()
+        # Resolve the STT key for THIS org (tenant isolation): the org's own
+        # groq/openai key, else the platform key only if ALLOW_PLATFORM_KEY_FALLBACK.
+        # get_stt_provider() raises RuntimeError when no key is available or the
+        # provider is unknown — that must NOT crash the task silently (this
+        # pipeline's contract is "never silence, always fall back to text"), so a
+        # missing/unconfigured key degrades to the same helpful text reply.
+        stt_provider_name = (settings.STT_PROVIDER or "groq").lower().strip()
+        async with async_session_maker() as db:
+            stt_key = await resolve_provider_key(db, org_id, stt_provider_name)
+        try:
+            stt = get_stt_provider(stt_provider_name, stt_key)
+        except RuntimeError as exc:
+            log.warning("voice_stt_provider_unconfigured", org_id=str(org_id), error=str(exc))
+            await send_text_message(org_id, contact_phone, _STT_FALLBACK)
+            return
         try:
             t0 = time.monotonic()
             result = await _with_retry(lambda: stt.transcribe(raw_path))
@@ -308,8 +323,11 @@ async def handle_voice_note(
             conversation = await conversation_service.get_or_create_channel_conversation(
                 db, org_id, contact.id, Channel.whatsapp
             )
+            # reply_channel="voice": this answer will be spoken back as a voice
+            # note, so a booking confirmation spells the name/email (STT mis-hear
+            # guard), same as the Retell voice channel.
             response_text = await conversation_service.process_customer_message(
-                db, org_id, conversation.id, result.text
+                db, org_id, conversation.id, result.text, reply_channel="voice"
             )
         log.info("voice_rag_complete", ms=round((time.monotonic() - t0) * 1000))
 
@@ -330,11 +348,14 @@ async def handle_voice_note(
             return
 
         # ── 10. TTS (with one retry on transient failure) ────────────────────
-        # RuntimeError from get_tts_provider_by_name (missing API key) is caught
-        # here alongside TTSError so a config-mismatch still falls back to text
-        # cleanly instead of bubbling up as an unhandled 500.
+        # Resolve the chosen TTS provider's key for THIS org (same isolation
+        # rule as STT). RuntimeError from get_tts_provider_by_name (no key /
+        # unknown provider) is caught here alongside TTSError so a config gap
+        # falls back to a text reply cleanly instead of bubbling up as a 500.
+        async with async_session_maker() as db:
+            tts_key = await resolve_provider_key(db, org_id, tts_provider_name)
         try:
-            tts = get_tts_provider_by_name(tts_provider_name)
+            tts = get_tts_provider_by_name(tts_provider_name, tts_key)
             t0 = time.monotonic()
             audio_bytes = await _with_retry(lambda: tts.synthesize(response_text))
             await asyncio.to_thread(tts_raw_path.write_bytes, audio_bytes)

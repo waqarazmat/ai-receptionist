@@ -122,9 +122,12 @@ async def get_org_llm_clients(
         sdk = _build_sdk(provider, api_key)
         clients.append(OrgLLMClient(provider=provider, model=models[provider], api_key=api_key, sdk=sdk))
 
-    if not clients:
-        # No org-level keys — fall back to the platform OpenAI key so voice
-        # test calls work for every org before their keys are configured.
+    if not clients and settings.ALLOW_PLATFORM_KEY_FALLBACK:
+        # No org-level keys — fall back to the platform OpenAI key so calls work
+        # for an org before its keys are configured. Gated by
+        # ALLOW_PLATFORM_KEY_FALLBACK: under strict tenant isolation this is off,
+        # and an unconfigured org raises NoLLMProviderConfiguredError below
+        # instead of ever running on the shared platform key.
         if settings.OPENAI_API_KEY:
             tier_models = QUALITY_MODELS if model_tier == "quality" else FAST_MODELS
             sdk = _build_sdk(ApiKeyProvider.openai, settings.OPENAI_API_KEY)

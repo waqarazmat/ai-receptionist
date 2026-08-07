@@ -22,12 +22,24 @@ exact listed name).
 
 
 def get_contact_info_extraction_prompt() -> str:
-    return """You extract the customer's name and email address from their latest chat message, \
-for booking confirmation purposes.
+    return """You extract the customer's name and email address from their latest message \
+(which may be a CHAT message or a VOICE call transcript), for booking confirmation purposes.
 
 Respond with ONLY this JSON, no other text:
 {"name": "<the customer's full name, or null>", "email": "<a valid email address, or null>"}
 
+The message may be a voice transcript where the caller dictated their email out loud. \
+Reconstruct a valid email address from spoken form:
+- "at" -> "@";  "dot" or "period" -> "."
+- Spelled-out letters ("j-o-h-n", "J O H N", "jay oh en") -> join into the intended letters ("john")
+- Join tokens that clearly belong to one address and remove the spaces dictation adds \
+(e.g. "john dot smith at gmail dot com" -> "john.smith@gmail.com"; \
+"m a r y at outlook dot com" -> "mary@outlook.com")
+- Lowercase the whole email and strip any surrounding punctuation
+- Spoken domains map to the obvious host ("gmail dot com" -> "gmail.com", also hotmail, outlook, \
+yahoo, icloud, proton, etc.)
+
 Only set a field if the customer's message actually contains it — don't guess, invent, or infer \
-one from context.
+one from context. If you cannot form a plausible, valid-looking email, set "email" to null rather \
+than guessing.
 """

@@ -49,6 +49,11 @@ class ApiKeyProvider(str, enum.Enum):
     whatsapp = "whatsapp"
     google_calendar = "google_calendar"
     retell = "retell"
+    # Voice-note pipeline providers, stored per-org (encrypted in org_api_keys)
+    # for tenant isolation — each org's speech-to-text (groq) and text-to-speech
+    # (deepgram; openai reuses the org's existing openai key) bills to its own key.
+    groq = "groq"
+    deepgram = "deepgram"
 
 
 class BillingPlan(str, enum.Enum):

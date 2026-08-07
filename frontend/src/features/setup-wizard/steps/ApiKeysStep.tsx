@@ -28,6 +28,23 @@ const PROVIDERS: ProviderConfig[] = [
     visible: (s) => Boolean(s.channels?.whatsapp),
   },
   {
+    // STT for WhatsApp voice notes — per-org so transcription bills to this org.
+    key: "groq",
+    label: "Groq API Key (voice transcription)",
+    placeholder: "Paste Groq API key",
+    masked: true,
+    visible: (s) => Boolean(s.channels?.whatsapp),
+  },
+  {
+    // TTS for WhatsApp voice replies. Optional — OpenAI TTS reuses the OpenAI
+    // key above; add this only to use Deepgram voices instead.
+    key: "deepgram",
+    label: "Deepgram API Key (voice replies, optional)",
+    placeholder: "Paste Deepgram API key",
+    masked: true,
+    visible: (s) => Boolean(s.channels?.whatsapp),
+  },
+  {
     key: "google_calendar",
     label: "Google Calendar ID",
     placeholder: "e.g. your-calendar-id@group.calendar.google.com",

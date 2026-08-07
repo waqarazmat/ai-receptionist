@@ -11,6 +11,19 @@ from app.channels.whatsapp.voice_handler import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_provider_key():
+    """Per-org STT/TTS key resolution hits the DB; these orchestrator tests mock
+    the session, so stub the resolver to hand back a dummy key. Tests that need
+    the "no key" path override this inside their own patch block."""
+    with patch(
+        "app.channels.whatsapp.voice_handler.resolve_provider_key",
+        new_callable=AsyncMock,
+        return_value="test-key",
+    ):
+        yield
+
+
 # ── _language_supported ───────────────────────────────────────────────────────
 
 
@@ -282,8 +295,9 @@ async def test_french_with_deepgram_default_wires_openai_tts():
 
             await handle_voice_note(org_id, contact_phone, "Client FR", "media_fr", "wamid_fr")
 
-        # Key assertion: the orchestrator wired the correct provider name into the factory
-        mock_tts_factory.assert_called_once_with("openai")
+        # Key assertion: the orchestrator wired the correct provider name + the
+        # per-org resolved key into the factory.
+        mock_tts_factory.assert_called_once_with("openai", "test-key")
         # And the TTS provider was actually invoked (not short-circuited to text)
         tts_instance.synthesize.assert_called_once_with("Nous sommes ouverts de 9h à 18h.")
     finally:
@@ -353,5 +367,104 @@ async def test_missing_fallback_api_key_sends_text_not_500():
         mock_text.assert_called_once_with(
             org_id, contact_phone, "Bonjour, comment puis-je vous aider?"
         )
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_no_org_stt_key_falls_back_to_text_not_silence():
+    """Tenant isolation path: the org has no STT key and there's no platform
+    fallback → resolve_provider_key returns None → the REAL get_stt_provider
+    raises RuntimeError → the pipeline degrades to a text reply ("never
+    silence"), never crashing the task with no reply at all."""
+    from app.channels.whatsapp.voice_handler import handle_voice_note
+
+    org_id = uuid.uuid4()
+    contact_phone = "+32499000005"
+    tmpdir, fake_scratch = _make_fake_scratch()
+
+    try:
+        stt_mock, contact_mock, conv_mock = _base_patches(stt_language="en", stt_text="hi")
+
+        with (
+            patch("app.channels.whatsapp.voice_handler.get_credentials", new_callable=AsyncMock, return_value=("tok", "ph_id")),
+            patch("app.channels.whatsapp.voice_handler._check_voice_rate_limit", new_callable=AsyncMock, return_value=True),
+            patch("app.channels.whatsapp.voice_handler.download_voice_note", new_callable=AsyncMock, return_value=1000),
+            patch("app.channels.whatsapp.voice_handler.probe_duration_seconds", new_callable=AsyncMock, return_value=5.0),
+            # No key for this org, no platform fallback → None (overrides the autouse stub).
+            patch("app.channels.whatsapp.voice_handler.resolve_provider_key", new_callable=AsyncMock, return_value=None),
+            patch("app.channels.whatsapp.voice_handler.async_session_maker") as mock_sm,
+            # Real get_stt_provider runs — with a None key it raises RuntimeError.
+            patch("app.channels.whatsapp.voice_handler.send_text_message", new_callable=AsyncMock) as mock_text,
+            patch("app.channels.whatsapp.voice_handler.get_tts_provider_by_name") as mock_tts_factory,
+            patch("app.channels.whatsapp.voice_handler._scratch_dir", fake_scratch),
+        ):
+            mock_sm.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+            mock_sm.return_value.__aexit__ = AsyncMock(return_value=False)
+            # Must NOT raise — degrades to a text reply.
+            await handle_voice_note(org_id, contact_phone, "Test", "media_nostt", "wamid_nostt")
+
+        mock_tts_factory.assert_not_called()  # never reached TTS
+        mock_text.assert_called_once()
+        assert "voice message" in mock_text.call_args[0][2].lower()  # the _STT_FALLBACK text
+    finally:
+        shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_voice_reply_path_requests_spoken_booking_readback():
+    """The spoken path must tell the pipeline reply_channel="voice" so a booking
+    confirmation spells the name/email back (STT mis-hear guard), matching the
+    Retell voice channel. The unsupported-language text fallback stays "text"."""
+    from app.channels.whatsapp.voice_handler import handle_voice_note
+
+    org_id = uuid.uuid4()
+    contact_phone = "+32499000004"
+    tmpdir, fake_scratch = _make_fake_scratch()
+
+    try:
+        stt_mock, contact_mock, conv_mock = _base_patches(
+            stt_language="en",
+            stt_text="Yeah, John Smith, john dot smith at gmail dot com",
+        )
+        tts_instance = MagicMock()
+        tts_instance.provider_name = "openai"
+        tts_instance.synthesize = AsyncMock(return_value=b"fake_mp3")
+
+        settings_override = MagicMock()
+        settings_override.TTS_PROVIDER = "openai"
+        settings_override.TTS_MULTILINGUAL_FALLBACK_PROVIDER = "openai"
+        settings_override.TTS_PROVIDER_LANGUAGE_SUPPORT = {"openai": ["en", "fr", "nl", "de"]}
+        settings_override.VOICE_SUPPORTED_LANGUAGES = ["en", "fr", "nl", "de"]
+        settings_override.MAX_VOICE_NOTE_FILE_SIZE_MB = 16.0
+        settings_override.MAX_VOICE_NOTE_DURATION_SECONDS = 120
+        settings_override.MAX_VOICE_REPLY_CHARS = 500
+        settings_override.VOICE_NOTE_RATE_LIMIT_PER_MINUTE = 5
+
+        with (
+            patch("app.channels.whatsapp.voice_handler.settings", settings_override),
+            patch("app.channels.whatsapp.voice_handler.get_credentials", new_callable=AsyncMock, return_value=("tok", "ph_id")),
+            patch("app.channels.whatsapp.voice_handler._check_voice_rate_limit", new_callable=AsyncMock, return_value=True),
+            patch("app.channels.whatsapp.voice_handler.download_voice_note", new_callable=AsyncMock, return_value=1000),
+            patch("app.channels.whatsapp.voice_handler.probe_duration_seconds", new_callable=AsyncMock, return_value=5.0),
+            patch("app.channels.whatsapp.voice_handler.get_stt_provider", return_value=stt_mock),
+            patch("app.channels.whatsapp.voice_handler.async_session_maker") as mock_sm,
+            patch("app.channels.whatsapp.voice_handler.contact_service") as mock_cs,
+            patch("app.channels.whatsapp.voice_handler.conversation_service") as mock_cvs,
+            patch("app.channels.whatsapp.voice_handler.get_tts_provider_by_name", return_value=tts_instance),
+            patch("app.channels.whatsapp.voice_handler.to_ogg_opus_mono", new_callable=AsyncMock),
+            patch("app.channels.whatsapp.voice_handler.upload_voice_reply", new_callable=AsyncMock, return_value="rmid"),
+            patch("app.channels.whatsapp.voice_handler.send_audio_message", new_callable=AsyncMock, return_value="wamid_out"),
+            patch("app.channels.whatsapp.voice_handler._scratch_dir", fake_scratch),
+        ):
+            mock_sm.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+            mock_sm.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cs.get_or_create_contact_by_phone = AsyncMock(return_value=contact_mock)
+            mock_cvs.get_or_create_channel_conversation = AsyncMock(return_value=conv_mock)
+            mock_cvs.process_customer_message = AsyncMock(return_value="Is that all correct?")
+
+            await handle_voice_note(org_id, contact_phone, "John", "media_en", "wamid_en")
+
+        assert mock_cvs.process_customer_message.call_args.kwargs.get("reply_channel") == "voice"
     finally:
         shutil.rmtree(str(tmpdir), ignore_errors=True)

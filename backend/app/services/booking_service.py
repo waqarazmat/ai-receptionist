@@ -47,6 +47,51 @@ def _format_time(dt: datetime) -> str:
     return dt.strftime("%I:%M %p").lstrip("0")
 
 
+def _spell_token(token: str) -> str:
+    """Hyphenate a token's characters so TTS reads them as individual letters/
+    digits: "john" -> "J-O-H-N". Uppercased because "J-O-H-N" is unambiguous for
+    a voice engine while "j-o-h-n" can be read as a word by some TTS voices."""
+    return "-".join(ch.upper() for ch in token if not ch.isspace())
+
+
+def _spell_name_for_voice(name: str) -> str:
+    """"John Smith" -> "J-O-H-N S-M-I-T-H" (each word spelled, words space-separated)."""
+    return " ".join(_spell_token(part) for part in name.split())
+
+
+def _spell_email_for_voice(email: str) -> str:
+    """Spell an email for a voice read-back: the local part letter-by-letter
+    (the most ASR-error-prone piece), with "@" and "." spoken as "at"/"dot".
+    "john.smith@gmail.com" -> "J-O-H-N dot S-M-I-T-H at gmail dot com". The domain
+    is spoken as words (common hosts don't need spelling) to keep it listenable."""
+    local, at, domain = email.partition("@")
+    local_spelled = " dot ".join(_spell_token(tok) for tok in local.split("."))
+    if not at:  # no "@" — spell the whole thing rather than dropping the domain
+        return local_spelled
+    domain_spoken = domain.replace(".", " dot ")
+    return f"{local_spelled} at {domain_spoken}"
+
+
+def _build_voice_confirmation(cd: dict, org_tz) -> str:
+    """Voice-channel booking confirmation that reads the details back AND spells
+    the name + email, so a caller can catch an ASR mis-hear before it's booked.
+    Text channels keep the plain FSM confirmation (the customer can read those)."""
+    service = cd.get("service", "your appointment")
+    name = (cd.get("customer_name") or "").strip()
+    email = (cd.get("customer_email") or "").strip()
+
+    start = _parse_slot_datetime(cd.get("date"), cd.get("time"), org_tz) if cd.get("date") and cd.get("time") else None
+    when = f"{start.strftime('%A, %B %d')} at {_format_time(start)}" if start else f"{cd.get('date')} at {cd.get('time')}"
+
+    parts = [f"Let me read that back to make sure I have it right — {service} on {when}."]
+    if name:
+        parts.append(f"Your name is {name}, spelled {_spell_name_for_voice(name)}.")
+    if email:
+        parts.append(f"And your email is {_spell_email_for_voice(email)}.")
+    parts.append("Is that all correct?")
+    return " ".join(parts)
+
+
 def _format_slot_options(slots: list[datetime]) -> str:
     # Include the date (e.g. "Tue Aug 11 at 10:30 AM") so "Tuesday" is never
     # ambiguous between this week and next.
@@ -172,6 +217,7 @@ async def process_booking_intent(
     contact_id: uuid.UUID,
     user_input: str,
     intent: str = "booking_request",
+    channel: str = "text",
 ) -> str:
     """Loads/creates the conversation's booking FSM, advances it with
     `user_input`, and returns the text to send back. On reaching BOOKED,
@@ -268,6 +314,17 @@ async def process_booking_intent(
         return response_text
 
     response_text = result["response_text"]
+
+    # On voice, replace the plain confirmation with a spelled read-back the first
+    # time we enter CONFIRMING (not on a re-prompt after an unclear yes/no, where
+    # previous_state is already CONFIRMING). Lets the caller catch an ASR mis-hear
+    # of their name/email before the booking is committed.
+    if (
+        channel == "voice"
+        and new_state == BookingState.CONFIRMING
+        and previous_state != BookingState.CONFIRMING
+    ):
+        response_text = _build_voice_confirmation(fsm.collected_data, org_tz)
 
     if new_state == BookingState.COLLECTING_SERVICE and service_by_name:
         response_text += " We offer: " + ", ".join(service_by_name.keys()) + "."

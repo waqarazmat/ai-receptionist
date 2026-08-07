@@ -1297,7 +1297,9 @@ async def _handle_turn(
             conv = await db.get(Conversation, conversation_id)
             contact_id = conv.contact_id if conv else None
             reply = (
-                await process_booking_intent(db, org_id, conversation_id, contact_id, message_text)
+                await process_booking_intent(
+                    db, org_id, conversation_id, contact_id, message_text, channel="voice"
+                )
                 if contact_id is not None
                 else FALLBACK_MESSAGE
             )

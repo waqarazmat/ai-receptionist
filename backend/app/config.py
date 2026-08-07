@@ -143,24 +143,36 @@ class Settings(BaseSettings):
     # Applied automatically at org creation; can still be overridden per-org.
     REGULATED_VERTICAL_RETENTION_DAYS: int = 90
 
+    # ── Tenant key isolation ───────────────────────────────────────────────
+    # When True, a provider key falls back to the platform-level env key below
+    # if the org hasn't configured its own (convenient for onboarding/dev). When
+    # False (strict isolation), an org with no key for a provider degrades
+    # gracefully instead of ever using a shared key — no org runs on another
+    # org's or the platform's key. Governs STT/TTS (voice pipeline) AND the LLM
+    # router's platform fallback. See app/services/api_key_service.py.
+    ALLOW_PLATFORM_KEY_FALLBACK: bool = True
+
     # ── WhatsApp Voice Note pipeline (STT + TTS) ───────────────────────────
-    # These are platform-level keys, distinct from per-org LLM keys stored in
-    # org_api_keys. STT/TTS are billed to the platform, not individual orgs.
+    # The keys below are PLATFORM-level FALLBACKS only. The pipeline prefers each
+    # org's own key (encrypted in org_api_keys: groq for STT, deepgram/openai for
+    # TTS) so speech billing is per-tenant; these env keys are used only when the
+    # org has none AND ALLOW_PLATFORM_KEY_FALLBACK is True.
 
     # "groq" (default, faster + cheaper) or "openai"
     STT_PROVIDER: str = "groq"
     # "openai" (default) or "deepgram"
     TTS_PROVIDER: str = "openai"
 
-    # Groq API key — required when STT_PROVIDER=groq
+    # Groq API key — platform fallback for STT when STT_PROVIDER=groq
     GROQ_API_KEY: str | None = None
 
-    # Platform-level OpenAI key — used for STT (gpt-4o-mini-transcribe) when
-    # STT_PROVIDER=openai, and for TTS (tts-1) when TTS_PROVIDER=openai.
-    # Separate from per-org keys in org_api_keys (those drive the RAG/LLM pipeline).
+    # Platform-fallback OpenAI key — STT (gpt-4o-mini-transcribe) when
+    # STT_PROVIDER=openai, and TTS (tts-1) when TTS_PROVIDER=openai. Per-org
+    # OpenAI keys in org_api_keys (which also drive the RAG/LLM pipeline) take
+    # precedence over this.
     OPENAI_API_KEY: str | None = None
 
-    # Deepgram API key — required when TTS_PROVIDER=deepgram
+    # Deepgram API key — platform fallback for TTS when TTS_PROVIDER=deepgram
     DEEPGRAM_API_KEY: str | None = None
 
     # Voice notes larger than this (MB) are rejected before download.

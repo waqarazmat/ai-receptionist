@@ -1,4 +1,12 @@
-export type ApiKeyProvider = "openai" | "anthropic" | "cohere" | "whatsapp" | "google_calendar" | "retell";
+export type ApiKeyProvider =
+  | "openai"
+  | "anthropic"
+  | "cohere"
+  | "whatsapp"
+  | "google_calendar"
+  | "retell"
+  | "groq"
+  | "deepgram";
 
 export interface BasicInfoStep {
   name: string;

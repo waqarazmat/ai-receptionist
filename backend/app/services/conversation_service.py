@@ -339,12 +339,19 @@ async def create_escalation(
 
 
 async def process_customer_message(
-    db: AsyncSession, org_id: uuid.UUID, conversation_id: uuid.UUID, message_text: str
+    db: AsyncSession, org_id: uuid.UUID, conversation_id: uuid.UUID, message_text: str,
+    reply_channel: str = "text",
 ) -> str | None:
     """The full non-streaming pipeline: analyze (safety+intent in one call) ->
     save -> route -> save AI response -> return it. Used directly by channels
     that don't need token streaming (WhatsApp, voice); the webchat handler
     reimplements this same routing with streaming instead of calling it directly.
+
+    `reply_channel` describes how the reply will be delivered: "voice" when the
+    answer will be spoken aloud (a WhatsApp voice-note reply), "text" otherwise.
+    It's passed down to the booking flow so a spoken confirmation spells the
+    caller's name/email back (catches an STT mis-hear), exactly as the Retell
+    voice channel does — text replies keep the plain read-back.
 
     Returns None if a staff member has taken over this conversation
     (conversation.assigned_to set) — the message is still saved and still
@@ -403,7 +410,8 @@ async def process_customer_message(
     elif booking_active or intent in ("booking_request", "booking_info"):
         # e. Booking — hands off to the FSM-driven booking flow instead of RAG.
         response_text = await process_booking_intent(
-            db, org_id, conversation_id, conversation.contact_id, message_text, intent
+            db, org_id, conversation_id, conversation.contact_id, message_text, intent,
+            channel=reply_channel,
         )
     elif intent == "off_topic":
         # g. Off-topic response from org config
