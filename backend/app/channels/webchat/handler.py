@@ -16,9 +16,10 @@ from app.models.organization import Organization
 from app.realtime.socket_manager import chat_sio as sio
 from app.security.rate_limiter import check_message_rate_limit, increment_message_count
 from app.services.booking_service import (
-    booking_session_active,
+    booking_session_state,
     clear_booking_session,
     process_booking_intent,
+    should_route_to_booking,
 )
 from app.services.conversation_service import (
     DECLINE_MESSAGE,
@@ -186,12 +187,14 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         contact = await db.get(Contact, conversation.contact_id)
         contact_name = contact.name if contact else None
 
-        # Sticky booking mode: once a booking is mid-flow, keep routing replies
-        # into the FSM regardless of how this message classified — the name/email
-        # and yes/no steps rarely look like a "booking" intent, and misrouting
-        # them to RAG is what abandons half-finished bookings. An explicit
-        # request for a human is the one thing allowed to break out.
-        booking_active = await booking_session_active(conversation_id)
+        # Sticky booking mode, but STATE-AWARE so the customer is never trapped:
+        # the name/email and yes/no steps stay sticky (their answers classify as
+        # off_topic/faq, and routing them to RAG would abandon the booking); in
+        # the earlier service/time steps a genuine question/greeting is answered
+        # normally instead of re-looping "what service?", with the booking session
+        # left alive to resume. An explicit request for a human always breaks out.
+        booking_active, booking_state = await booking_session_state(conversation_id)
+        route_to_booking = should_route_to_booking(booking_active, booking_state, intent)
 
         if intent == "escalation_request":
             # f. Escalation — abandon any in-progress booking first.
@@ -202,7 +205,7 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
             await _send_complete_reply(sid, ESCALATION_MESSAGE)
             return
 
-        if booking_active or intent in ("booking_request", "booking_info"):
+        if route_to_booking:
             # e. Booking — hands off to the FSM-driven booking flow instead of RAG.
             response_text = await process_booking_intent(
                 db, org_id, conversation_id, conversation.contact_id, message_text, intent

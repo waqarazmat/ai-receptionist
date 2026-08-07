@@ -47,6 +47,25 @@ def _format_time(dt: datetime) -> str:
     return dt.strftime("%I:%M %p").lstrip("0")
 
 
+def _format_time_voice(dt: datetime) -> str:
+    """Time phrased for text-to-speech: drop the ":00" on the hour so it reads
+    "9 PM" not "9:00 PM"/"nine o'clock zero zero". Keeps minutes when present
+    ("10:30 AM")."""
+    if dt.minute == 0:
+        return dt.strftime("%I %p").lstrip("0")
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _ordinal(n: int) -> str:
+    """1 -> '1st', 2 -> '2nd', 3 -> '3rd', 11 -> '11th', 21 -> '21st'. Used so a
+    spoken date reads "August 11th", not "August eleven"."""
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def _spell_token(token: str) -> str:
     """Hyphenate a token's characters so TTS reads them as individual letters/
     digits: "john" -> "J-O-H-N". Uppercased because "J-O-H-N" is unambiguous for
@@ -81,7 +100,10 @@ def _build_voice_confirmation(cd: dict, org_tz) -> str:
     email = (cd.get("customer_email") or "").strip()
 
     start = _parse_slot_datetime(cd.get("date"), cd.get("time"), org_tz) if cd.get("date") and cd.get("time") else None
-    when = f"{start.strftime('%A, %B %d')} at {_format_time(start)}" if start else f"{cd.get('date')} at {cd.get('time')}"
+    when = (
+        f"{start.strftime('%A, %B')} {_ordinal(start.day)} at {_format_time_voice(start)}"
+        if start else f"{cd.get('date')} at {cd.get('time')}"
+    )
 
     parts = [f"Let me read that back to make sure I have it right — {service} on {when}."]
     if name:
@@ -92,9 +114,16 @@ def _build_voice_confirmation(cd: dict, org_tz) -> str:
     return " ".join(parts)
 
 
-def _format_slot_options(slots: list[datetime]) -> str:
-    # Include the date (e.g. "Tue Aug 11 at 10:30 AM") so "Tuesday" is never
-    # ambiguous between this week and next.
+def _format_slot_options(slots: list[datetime], channel: str = "text") -> str:
+    # Include the date so "Tuesday" is never ambiguous between this week and next.
+    # Voice spells day/month in full ("Monday, August 11th at 9 PM") because
+    # abbreviations ("Mon Aug 11") read badly through TTS; text keeps the compact
+    # form that's easy to scan on screen ("Tue Aug 11 at 10:30 AM").
+    if channel == "voice":
+        return ", ".join(
+            f"{slot.strftime('%A, %B')} {_ordinal(slot.day)} at {_format_time_voice(slot)}"
+            for slot in slots
+        )
     return ", ".join(f"{slot.strftime('%a %b %d')} at {_format_time(slot)}" for slot in slots)
 
 
@@ -202,6 +231,43 @@ async def booking_session_active(conversation_id: uuid.UUID) -> bool:
     return fsm.current_state not in (BookingState.IDLE, BookingState.BOOKED, BookingState.CANCELLED)
 
 
+# States where a reply that DOESN'T look like a booking answer must still stay in
+# the FSM: the caller is being asked for their name/email or a yes/no, and those
+# answers ("John", "john@x.com", "yes") classify as off_topic/faq — routing them
+# to RAG would abandon the booking. In the earlier service/time-collection states
+# a genuine question/greeting should instead be answered normally (see the
+# channel routers), so the customer isn't trapped re-hearing "what service?".
+STICKY_BOOKING_STATES = (BookingState.COLLECTING_CONTACT_INFO, BookingState.CONFIRMING)
+
+_BOOKING_INTENTS = ("booking_request", "booking_info")
+
+
+def should_route_to_booking(booking_active: bool, booking_state: BookingState, intent: str) -> bool:
+    """Whether a customer message should be handled by the booking FSM (vs
+    answered normally by RAG). Escalation is decided by the caller before this.
+
+    - A booking-shaped intent always routes in (starts or continues a booking).
+    - While a booking is mid-flow, the sticky states (collecting name/email, or
+      confirming) route in even for off_topic/faq-looking messages, because those
+      answers ("John", "john@x.com", "yes") classify that way.
+    - In the earlier service/time-collection states, a non-booking message
+      (a question, greeting, farewell) does NOT route in — it's answered normally
+      so the customer isn't trapped re-hearing "what service?" / "what time?".
+    """
+    if intent in _BOOKING_INTENTS:
+        return True
+    return booking_active and booking_state in STICKY_BOOKING_STATES
+
+
+async def booking_session_state(conversation_id: uuid.UUID) -> tuple[bool, BookingState]:
+    """(is a booking mid-flow?, its current state). Lets channel routers keep the
+    name/email + confirm steps sticky while allowing questions to break out of the
+    earlier service/time steps — see STICKY_BOOKING_STATES."""
+    fsm = await BookingFSM.load(str(conversation_id))
+    active = fsm.current_state not in (BookingState.IDLE, BookingState.BOOKED, BookingState.CANCELLED)
+    return active, fsm.current_state
+
+
 async def clear_booking_session(conversation_id: uuid.UUID) -> None:
     """Drop any in-progress booking state — used when the customer breaks out
     of a booking (e.g. escalates to a human) so it doesn't linger in Redis and
@@ -251,6 +317,12 @@ async def process_booking_intent(
         if extracted.get("time"):
             fsm.collected_data["time"] = extracted["time"]
 
+        # Single-service org: there's nothing to choose, so don't make the
+        # customer name the only service (which just produces a "what service?
+        # — we offer X" loop). Auto-select it and move straight on to the time.
+        if not fsm.collected_data.get("service") and len(service_by_name) == 1:
+            fsm.collected_data["service"] = next(iter(service_by_name))
+
         # Whenever we now hold a concrete date+time, validate it against real
         # availability; if it isn't bookable, drop it and offer alternatives.
         if fsm.collected_data.get("date") and fsm.collected_data.get("time"):
@@ -269,7 +341,7 @@ async def process_booking_intent(
                 if alternatives:
                     return (
                         f"Sorry, that time isn't available. Some other options: "
-                        f"{_format_slot_options(alternatives)}. What works for you?"
+                        f"{_format_slot_options(alternatives, channel)}. What works for you?"
                     )
                 return "Sorry, that time isn't available and I couldn't find another opening soon — could you try a different day?"
 
@@ -333,7 +405,7 @@ async def process_booking_intent(
         duration = service.get("duration_minutes", DEFAULT_SERVICE_DURATION_MINUTES)
         slots = await _next_available_slots(db, org_id, duration, org_tz)
         if slots:
-            response_text += f" Some open times: {_format_slot_options(slots)}."
+            response_text += f" Some open times: {_format_slot_options(slots, channel)}."
 
     await fsm.save()
     return response_text

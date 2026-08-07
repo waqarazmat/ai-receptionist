@@ -4,14 +4,64 @@ These spell the caller's name + email back before a booking is committed, so an
 ASR mis-hear can be caught. Pure functions — no DB / LLM / Redis.
 """
 
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.services.booking_service import (
     _build_voice_confirmation,
+    _format_slot_options,
+    _format_time_voice,
+    _ordinal,
     _spell_email_for_voice,
     _spell_name_for_voice,
     _spell_token,
 )
+
+
+class TestOrdinal:
+    def test_common_ordinals(self):
+        assert _ordinal(1) == "1st"
+        assert _ordinal(2) == "2nd"
+        assert _ordinal(3) == "3rd"
+        assert _ordinal(4) == "4th"
+
+    def test_teens_are_all_th(self):
+        assert _ordinal(11) == "11th"
+        assert _ordinal(12) == "12th"
+        assert _ordinal(13) == "13th"
+
+    def test_twenties(self):
+        assert _ordinal(21) == "21st"
+        assert _ordinal(22) == "22nd"
+        assert _ordinal(23) == "23rd"
+
+
+class TestFormatTimeVoice:
+    def test_drops_zero_minutes(self):
+        assert _format_time_voice(datetime(2026, 8, 11, 21, 0)) == "9 PM"
+        assert _format_time_voice(datetime(2026, 8, 11, 9, 0)) == "9 AM"
+
+    def test_keeps_non_zero_minutes(self):
+        assert _format_time_voice(datetime(2026, 8, 11, 10, 30)) == "10:30 AM"
+
+
+class TestFormatSlotOptions:
+    SLOTS = [datetime(2026, 8, 11, 21, 0), datetime(2026, 8, 12, 10, 30)]  # Tue, Wed
+
+    def test_text_uses_compact_abbreviations(self):
+        out = _format_slot_options(self.SLOTS, "text")
+        assert "Tue Aug 11 at 9:00 PM" in out
+        assert "Wed Aug 12 at 10:30 AM" in out
+
+    def test_voice_uses_full_words_and_ordinals(self):
+        out = _format_slot_options(self.SLOTS, "voice")
+        assert "Tuesday, August 11th at 9 PM" in out
+        assert "Wednesday, August 12th at 10:30 AM" in out
+        # No abbreviations that read badly through TTS.
+        assert "Tue " not in out and "Aug " not in out
+
+    def test_default_channel_is_text(self):
+        assert _format_slot_options(self.SLOTS) == _format_slot_options(self.SLOTS, "text")
 
 
 class TestSpellToken:
@@ -82,7 +132,8 @@ class TestBuildVoiceConfirmation:
         # Formatted, not the raw ISO string.
         assert "2026-08-11" not in msg
         assert "14:00" not in msg
-        assert "Tuesday" in msg and "2:00 PM" in msg
+        # Full-word, TTS-friendly date/time: "Tuesday, August 11th at 2 PM".
+        assert "Tuesday, August 11th at 2 PM" in msg
 
     def test_ends_with_correctness_question(self):
         msg = _build_voice_confirmation(self._cd(), self.TZ)
