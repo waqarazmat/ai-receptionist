@@ -77,6 +77,19 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
         "- Keep responses concise and conversational — this is a chat, not an essay.",
     ]
 
+    # Reply-language matching (text/WhatsApp only — the voice channel enforces a
+    # specific language via its own menu instruction appended downstream, so we
+    # don't add a conflicting rule here). Lets the knowledge base be in one
+    # language while the customer is served in theirs: the multilingual embedding
+    # model retrieves the right chunks across languages, and this makes the LLM
+    # answer in the customer's language regardless of the knowledge's language.
+    if not voice_mode:
+        lines.append(
+            "- Reply in the SAME language the customer is using (Dutch, French, English, etc.). "
+            "The reference knowledge below may be written in a different language — use it anyway "
+            "and answer in the customer's language."
+        )
+
     if customer_name:
         lines.append(f"- The customer's name is {customer_name}. Use it naturally, not in every message.")
 

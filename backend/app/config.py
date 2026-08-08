@@ -16,6 +16,20 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     REDIS_URL: str
 
+    # ── Embeddings (RAG retrieval) ────────────────────────────────────────────
+    # Multilingual by default so an English question retrieves relevant chunks
+    # from a Dutch (or any-language) knowledge base — the embedding model, not
+    # the LLM, is what makes cross-lingual retrieval work. Both this and the old
+    # all-MiniLM-L6-v2 output 384-dim vectors, so the pgvector column is
+    # unchanged. Changing this REQUIRES re-embedding every existing chunk with
+    # the new model (see scripts/reembed_chunks.py) — query and stored vectors
+    # must come from the same model.
+    EMBEDDING_MODEL_NAME: str = "paraphrase-multilingual-MiniLM-L12-v2"
+    # Token window for the embedder. The multilingual MiniLM defaults to 128,
+    # which truncates our longer KB chunks (~800 chars); widen it so chunk tails
+    # aren't lost. Never narrowed below the model's own default.
+    EMBEDDING_MAX_SEQ_LENGTH: int = 256
+
     JWT_SECRET_KEY: str
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7

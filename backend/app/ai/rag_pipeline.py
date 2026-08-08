@@ -56,11 +56,16 @@ async def hybrid_search(
     )
     semantic_rows = (await db.execute(semantic_stmt)).all()
 
+    # 'simple' (not 'english') so full-text search is language-neutral: no
+    # English stemming that would mangle Dutch/other-language content, and no
+    # English stop-word list dropping meaningful foreign words. The multilingual
+    # embedding leg carries cross-lingual matching; FTS here is the exact-keyword
+    # backstop, which 'simple' handles correctly for any language.
     fts_condition = text(
-        "to_tsvector('english', content) @@ plainto_tsquery('english', :query)"
+        "to_tsvector('simple', content) @@ plainto_tsquery('simple', :query)"
     ).bindparams(query=query_text)
     fts_order = text(
-        "ts_rank_cd(to_tsvector('english', content), plainto_tsquery('english', :query)) DESC"
+        "ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', :query)) DESC"
     ).bindparams(query=query_text)
 
     fts_stmt = (

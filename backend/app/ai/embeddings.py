@@ -26,6 +26,8 @@ import torch
 
 from sentence_transformers import SentenceTransformer
 
+from app.config import settings
+
 logger = structlog.get_logger()
 
 EMBEDDING_DIMENSIONS = 384
@@ -58,7 +60,30 @@ def load_model() -> None:
             omp_num_threads=os.environ.get("OMP_NUM_THREADS"),
             mkl_num_threads=os.environ.get("MKL_NUM_THREADS"),
         )
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
+        # Widen the token window so longer KB chunks aren't truncated (the
+        # multilingual MiniLM ships with a 128-token default).
+        if model.max_seq_length < settings.EMBEDDING_MAX_SEQ_LENGTH:
+            model.max_seq_length = settings.EMBEDDING_MAX_SEQ_LENGTH
+        # Method was renamed across sentence-transformers versions — prefer the
+        # new name, fall back to the old so this works on either.
+        get_dim = getattr(model, "get_embedding_dimension", None) or model.get_sentence_embedding_dimension
+        dim = get_dim()
+        if dim != EMBEDDING_DIMENSIONS:
+            # A wrong-dimension model can't be stored in the Vector(384) column —
+            # fail loudly at startup rather than corrupt every embedding write.
+            raise RuntimeError(
+                f"Embedding model {settings.EMBEDDING_MODEL_NAME!r} outputs {dim} dims, "
+                f"but the schema expects {EMBEDDING_DIMENSIONS}. Use a 384-dim model "
+                "or migrate the knowledge_chunks.embedding column."
+            )
+        logger.info(
+            "embedding_model_loaded",
+            model=settings.EMBEDDING_MODEL_NAME,
+            dimensions=dim,
+            max_seq_length=model.max_seq_length,
+        )
+        _model = model
 
 
 def _get_model() -> SentenceTransformer:
