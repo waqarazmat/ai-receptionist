@@ -61,6 +61,25 @@ class TestShouldRouteToBooking:
             True, BookingState.COLLECTING_TIME, "faq", "would 1pm work?"
         ) is True
 
+    # ── the THIRD bug: a question the classifier tags as a BOOKING intent must
+    # still break out to be answered, not trap the customer re-hearing "what time?"
+    def test_booking_info_question_in_time_breaks_out(self):
+        assert should_route_to_booking(
+            True, BookingState.COLLECTING_TIME, "booking_info",
+            "can I book for my whole family on the same day?",
+        ) is False
+
+    def test_booking_request_question_in_service_breaks_out(self):
+        assert should_route_to_booking(
+            True, BookingState.COLLECTING_SERVICE, "booking_request", "how soon can I get in?"
+        ) is False
+
+    def test_booking_info_time_answer_still_stays_in(self):
+        # a booking-intent reply that IS a real time must still stay in the FSM
+        assert should_route_to_booking(
+            True, BookingState.COLLECTING_TIME, "booking_info", "next tuesday at 2pm"
+        ) is True
+
     # ── name/email + confirm stay sticky (answers look like off_topic/faq) ──
     def test_off_topic_in_contact_info_stays_sticky(self):
         # a bare name/email classifies as off_topic but must reach the FSM

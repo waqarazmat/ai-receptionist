@@ -287,17 +287,33 @@ def should_route_to_booking(
       answered normally, so the customer is neither trapped re-hearing "what time?"
       nor silently dropped out of the booking when they answer it.
     """
-    if intent in _BOOKING_INTENTS:
-        return True
     if not booking_active:
-        return False
+        # No booking in progress yet — only a booking-shaped intent starts one.
+        return intent in _BOOKING_INTENTS
+
+    # A booking is mid-flow.
     if booking_state in STICKY_BOOKING_STATES:
+        # Collecting name/email or confirming: the answers ("John", "yes") look
+        # like faq/off_topic, so stay in the FSM unconditionally.
         return True
+
     if booking_state in (BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
+        # A concrete scheduling answer ("sun 1pm", "tomorrow") always stays in.
         if _looks_like_scheduling_answer(message_text):
             return True
-        return not _looks_like_question(message_text)
-    return False
+        # A genuine question breaks out to be answered — EVEN if the classifier
+        # tagged it a booking intent (e.g. "can I book for my whole family on the
+        # same day?" often classifies as booking_info). Otherwise the customer is
+        # trapped re-hearing "what day and time?" instead of getting an answer.
+        # The booking session stays alive (Redis), so they resume by naming a time.
+        if _looks_like_question(message_text):
+            return False
+        # Not a question and not obviously a time — a bare service answer
+        # ("cleaning") or a booking continuation: keep the booking going.
+        return True
+
+    # Any other active state: continue only on a booking-shaped intent.
+    return intent in _BOOKING_INTENTS
 
 
 async def booking_session_state(conversation_id: uuid.UUID) -> tuple[bool, BookingState]:
