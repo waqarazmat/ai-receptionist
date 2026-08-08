@@ -266,6 +266,12 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
           Add Chunk
         </Button>
 
+        {saveKnowledgeBase.isError && (
+          <p className="rounded-md bg-red-50 dark:bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-400">
+            Couldn't save the knowledge base: {getErrorMessage(saveKnowledgeBase.error)}
+          </p>
+        )}
+
         <StepFooter onBack={onBack} isSaving={saveKnowledgeBase.isPending} />
       </form>
 

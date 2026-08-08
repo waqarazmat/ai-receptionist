@@ -1,3 +1,4 @@
+import re
 import uuid
 
 import structlog
@@ -56,6 +57,36 @@ Respond with ONLY this JSON, no other text:
 """
 
 
+# Deterministic keyword fallback for when the classifier LLM call FAILS. Blindly
+# defaulting to "faq" there is dangerous for booking: a booking message then falls
+# through to RAG, and the general LLM role-plays a fake booking (asks for details,
+# claims it's "confirmed") that never reaches the FSM — no appointment, no calendar
+# event. A booking/escalation phrase is a strong enough signal to route correctly
+# even without the classifier. Only used on the failure path, so it can't override
+# a successful (and more nuanced) classification of e.g. "what are your appointment
+# hours?" as faq.
+_BOOKING_KW_RE = re.compile(
+    r"\b(book|booking|schedule|re-?schedul\w*|re-?book\w*|reserve|reservation|appointment|"
+    r"cancel\s+(?:my|the|an)\s+appointment)\b",
+    re.IGNORECASE,
+)
+_ESCALATION_KW_RE = re.compile(
+    r"\b(speak|talk)\s+to\s+(?:a\s+)?(human|person|someone|agent|representative|staff|"
+    r"receptionist)\b|\b(real|actual)\s+(human|person)\b",
+    re.IGNORECASE,
+)
+
+
+def _fallback_intent(text: str) -> str:
+    """Best-effort intent from keywords, used ONLY when the classifier LLM call
+    errored. Better than a blanket 'faq' default, which silently breaks booking."""
+    if _ESCALATION_KW_RE.search(text or ""):
+        return "escalation_request"
+    if _BOOKING_KW_RE.search(text or ""):
+        return "booking_request"
+    return "faq"
+
+
 async def analyze_message(
     db: AsyncSession, text: str, conversation_history: list[dict], org_id: uuid.UUID
 ) -> dict:
@@ -75,6 +106,12 @@ async def analyze_message(
         intent = parsed.get("intent")
         if intent not in INTENTS:
             intent = "faq"
+        # Logged so the routing decision is visible in prod logs — e.g. to confirm
+        # a booking phrase actually classified as booking_request and reached the FSM.
+        logger.info(
+            "message_classified", org_id=str(org_id), intent=intent,
+            confidence=float(parsed.get("confidence", 0.5)),
+        )
         return {
             "is_safe": bool(parsed.get("is_safe", True)),
             "safety_reason": parsed.get("safety_reason"),
@@ -84,7 +121,9 @@ async def analyze_message(
     except (LLMProviderError, NoLLMProviderConfiguredError, ValueError, TypeError) as exc:
         # Fail open on safety — defense-in-depth elsewhere (RAG confidence
         # threshold, org escalation rules) still catches genuinely bad input.
-        # Default to "faq" on intent — the safest fallback, since it just
-        # routes into RAG, which itself escalates cleanly on a weak match.
-        logger.warning("message_analysis_failed", org_id=str(org_id), error=str(exc))
-        return {"is_safe": True, "safety_reason": None, "intent": "faq", "confidence": 0.0}
+        # For intent, fall back to keyword detection rather than a blanket "faq":
+        # a booking phrase must still reach the FSM, or the general LLM role-plays
+        # a fake booking that never creates an appointment (see _fallback_intent).
+        fallback = _fallback_intent(text)
+        logger.warning("message_analysis_failed", org_id=str(org_id), error=str(exc), fallback_intent=fallback)
+        return {"is_safe": True, "safety_reason": None, "intent": fallback, "confidence": 0.0}

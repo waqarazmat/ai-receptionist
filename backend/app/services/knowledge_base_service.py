@@ -452,9 +452,18 @@ async def replace_knowledge_base(
     and fully replace its chunks (simplest correct behavior for a setup-wizard
     step that can be revisited — avoids accumulating stale duplicate chunks).
     """
+    # .first(), NOT .scalar_one_or_none(): repeated website crawls could create
+    # several KBs with the same name, and scalar_one_or_none() RAISES on more
+    # than one match — which 500'd the wizard's "Save and continue". Take the
+    # oldest match instead. (New crawls no longer create duplicates — they reuse
+    # the org's primary KB — but existing duplicates must not crash the save.)
     kb = (
-        await db.execute(select(KnowledgeBase).where(KnowledgeBase.org_id == org_id, KnowledgeBase.name == name))
-    ).scalar_one_or_none()
+        await db.execute(
+            select(KnowledgeBase)
+            .where(KnowledgeBase.org_id == org_id, KnowledgeBase.name == name)
+            .order_by(KnowledgeBase.created_at)
+        )
+    ).scalars().first()
 
     if kb is None:
         kb = KnowledgeBase(org_id=org_id, name=name)
