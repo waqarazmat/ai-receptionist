@@ -184,8 +184,11 @@ class Settings(BaseSettings):
     TEMP_AUDIO_DIR: str = "/tmp/voice_notes"
 
     # Replies longer than this are sent as text instead of TTS audio — long
-    # voice notes are bad UX and cost more per character on TTS providers.
-    MAX_VOICE_REPLY_CHARS: int = 500
+    # voice notes are bad UX and cost more per character on TTS providers. The
+    # voice path also instructs the LLM to answer concisely (2-3 sentences, no
+    # markdown — see response_generator._VOICE_STYLE_INSTRUCTION), so a normal
+    # spoken answer sits well under this; the cap just catches the rare long one.
+    MAX_VOICE_REPLY_CHARS: int = 700
 
     # ISO 639-1 codes the pipeline accepts. Languages outside this list get a
     # text reply instead of audio. Set to ["*"] to disable the check.

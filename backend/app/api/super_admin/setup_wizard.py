@@ -1,7 +1,7 @@
 import uuid
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_admin_db_session, require_super_admin
@@ -10,6 +10,8 @@ from app.models.user import User
 from app.schemas.knowledge_base import (
     BulkImportRequest,
     BulkImportResult,
+    ClearKnowledgeBaseResult,
+    DocumentUploadResult,
     WebsiteCrawlRequest,
     WebsiteCrawlResult,
 )
@@ -236,6 +238,95 @@ async def save_knowledge_base(
         ip_address=_client_ip(request),
     )
     return org
+
+
+@router.delete(
+    "/organizations/{org_id}/setup/knowledge-base/chunks", response_model=ClearKnowledgeBaseResult
+)
+async def clear_knowledge_base_wizard(
+    org_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_admin_db_session),
+) -> ClearKnowledgeBaseResult:
+    """Delete ALL knowledge chunks for an org (manual, crawled, and uploaded).
+    Destructive and not reversible — the UI confirms first. Audit-logged."""
+    try:
+        await org_service.get_organization(db, org_id)
+    except org_service.OrganizationNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    deleted = await knowledge_base_service.clear_knowledge_base(db, org_id)
+
+    await log_action(
+        db,
+        user_id=current_user.id,
+        action="setup_wizard.knowledge_base_clear",
+        target_type="organization",
+        target_id=org_id,
+        details={"chunks_deleted": deleted},
+        ip_address=_client_ip(request),
+    )
+    return ClearKnowledgeBaseResult(chunks_deleted=deleted)
+
+
+_MAX_DOC_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB — plenty for a clinic's docs
+
+
+@router.post("/organizations/{org_id}/setup/knowledge-base/upload", response_model=DocumentUploadResult)
+async def upload_knowledge_base_document(
+    org_id: uuid.UUID,
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_admin_db_session),
+) -> DocumentUploadResult:
+    """Ingest an uploaded PDF/DOCX/TXT/MD into the org's knowledge base: extract
+    text, chunk it, embed, and ADD the chunks (existing ones are kept)."""
+    try:
+        await org_service.get_organization(db, org_id)
+    except org_service.OrganizationNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
+
+    filename = file.filename or "document"
+    if not filename.lower().endswith(knowledge_base_service.SUPPORTED_DOC_EXTENSIONS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported file type. Upload a PDF, DOCX, TXT, or MD file.",
+        )
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The file is empty.")
+    if len(data) > _MAX_DOC_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File too large (max {_MAX_DOC_UPLOAD_BYTES // (1024 * 1024)} MB).",
+        )
+
+    kb = await knowledge_base_service.get_or_create_org_knowledge_base(db, org_id)
+    result = await knowledge_base_service.ingest_document(db, org_id, kb.id, filename, data)
+
+    if result["chunks_created"] > 0:
+        org = await org_service.get_organization(db, org_id)
+        org.setup_progress = {**(org.setup_progress or {}), "knowledge_base": True}
+        await db.commit()
+
+    await log_action(
+        db,
+        user_id=current_user.id,
+        action="setup_wizard.knowledge_base_upload",
+        target_type="organization",
+        target_id=org_id,
+        details={"filename": filename, **result},
+        ip_address=_client_ip(request),
+    )
+    return DocumentUploadResult(
+        knowledge_base_id=kb.id,
+        knowledge_base_name=kb.name,
+        filename=filename,
+        chunks_created=result["chunks_created"],
+        errors=result["errors"],
+    )
 
 
 @router.post("/organizations/{org_id}/setup/knowledge-base/crawl", response_model=WebsiteCrawlResult)

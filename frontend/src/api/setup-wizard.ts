@@ -6,6 +6,8 @@ import type {
   BasicInfoStep,
   BookingConfigStep,
   ChannelConfigStep,
+  ClearKnowledgeBaseResult,
+  DocumentUploadResult,
   KnowledgeBaseStep,
   SetupStateResponse,
   StaffAccessStep,
@@ -151,6 +153,35 @@ export function useCrawlWebsite(orgId: string) {
     mutationFn: (data: WebsiteCrawlRequest) =>
       apiClient
         .post<WebsiteCrawlResult>(`/api/admin/organizations/${orgId}/setup/knowledge-base/crawl`, data)
+        .then((r) => r.data),
+    onSuccess: invalidate,
+  });
+}
+
+export function useUploadKnowledgeBaseDocument(orgId: string) {
+  const invalidate = useInvalidateAfterSave(orgId);
+  return useMutation({
+    mutationFn: (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      return apiClient
+        .post<DocumentUploadResult>(
+          `/api/admin/organizations/${orgId}/setup/knowledge-base/upload`,
+          form,
+          { headers: { "Content-Type": "multipart/form-data" } },
+        )
+        .then((r) => r.data);
+    },
+    onSuccess: invalidate,
+  });
+}
+
+export function useClearKnowledgeBase(orgId: string) {
+  const invalidate = useInvalidateAfterSave(orgId);
+  return useMutation({
+    mutationFn: () =>
+      apiClient
+        .delete<ClearKnowledgeBaseResult>(`/api/admin/organizations/${orgId}/setup/knowledge-base/chunks`)
         .then((r) => r.data),
     onSuccess: invalidate,
   });

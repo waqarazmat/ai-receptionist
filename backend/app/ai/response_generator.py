@@ -27,6 +27,19 @@ DEFAULT_OFF_TOPIC_MESSAGE = "I'm sorry, I can only help with questions related t
 # Only these message roles feed back into the LLM as conversation turns.
 _HISTORY_ROLE_MAP = {"customer": "user", "ai": "assistant"}
 
+# Appended to the system prompt when the reply will be SPOKEN aloud (a WhatsApp
+# voice-note answer). Keeps answers short and TTS-friendly so they're spoken back
+# as audio instead of tripping the length cap and falling to text — and so the AI
+# never dictates bullet points/asterisks, which sound wrong read aloud. Placed
+# last so it takes precedence over the org's formatting habits.
+_VOICE_STYLE_INSTRUCTION = (
+    "\n\nIMPORTANT — your reply will be spoken aloud as a voice message. Keep it "
+    "short and natural: at most 2-3 sentences of plain conversational speech. Do "
+    "NOT use bullet points, numbered lists, asterisks, bold, or any markdown — "
+    "they sound wrong when read aloud. If there is more to cover, give a brief "
+    "spoken summary and offer to go into detail or send it in writing."
+)
+
 
 @dataclass
 class GenerationPlan:
@@ -52,6 +65,7 @@ async def build_generation_plan(
     chunks: list[ChunkResult],
     conversation_history: list[dict],
     contact_name: str | None = None,
+    reply_channel: str = "text",
 ) -> GenerationPlan:
     if intent == "escalation_request":
         return GenerationPlan(shortcut_text=ESCALATION_MESSAGE)
@@ -74,6 +88,10 @@ async def build_generation_plan(
             "customer_name": contact_name,
         }
     )
+
+    # Spoken reply (WhatsApp voice note): keep it short + TTS-friendly.
+    if reply_channel == "voice":
+        system_prompt += _VOICE_STYLE_INSTRUCTION
 
     history_messages = [
         {"role": _HISTORY_ROLE_MAP[m["role"]], "content": m["content"]}
@@ -99,8 +117,11 @@ async def generate_response(
     chunks: list[ChunkResult],
     conversation_history: list[dict],
     contact_name: str | None = None,
+    reply_channel: str = "text",
 ) -> str:
-    plan = await build_generation_plan(db, org_id, intent, chunks, conversation_history, contact_name)
+    plan = await build_generation_plan(
+        db, org_id, intent, chunks, conversation_history, contact_name, reply_channel
+    )
     if plan.shortcut_text is not None:
         return plan.shortcut_text
 

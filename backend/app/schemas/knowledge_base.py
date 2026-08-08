@@ -68,3 +68,16 @@ class BulkImportResult(BaseModel):
     knowledge_base_name: str
     chunks_created: int
     errors: list[str] = []
+
+
+class DocumentUploadResult(BaseModel):
+    """Result of ingesting an uploaded PDF/DOCX/TXT/MD into the KB."""
+    knowledge_base_id: uuid.UUID
+    knowledge_base_name: str
+    filename: str
+    chunks_created: int
+    errors: list[str] = []
+
+
+class ClearKnowledgeBaseResult(BaseModel):
+    chunks_deleted: int

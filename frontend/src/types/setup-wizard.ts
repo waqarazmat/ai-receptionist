@@ -74,6 +74,18 @@ export interface WebsiteCrawlResult {
   errors: string[];
 }
 
+export interface DocumentUploadResult {
+  knowledge_base_id: string;
+  knowledge_base_name: string;
+  filename: string;
+  chunks_created: number;
+  errors: string[];
+}
+
+export interface ClearKnowledgeBaseResult {
+  chunks_deleted: number;
+}
+
 export interface BookingServiceInput {
   name: string;
   duration_minutes: number;

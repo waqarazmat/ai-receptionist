@@ -1,7 +1,12 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Globe, Plus, Trash2, Upload } from "lucide-react";
-import { useCrawlWebsite, useSaveKnowledgeBase } from "../../../api/setup-wizard";
+import { FileText, Globe, Plus, Trash2, Upload } from "lucide-react";
+import {
+  useClearKnowledgeBase,
+  useCrawlWebsite,
+  useSaveKnowledgeBase,
+  useUploadKnowledgeBaseDocument,
+} from "../../../api/setup-wizard";
 import { Button } from "../../../components/ui/Button";
 import { Input } from "../../../components/ui/Input";
 import { Textarea } from "../../../components/ui/Textarea";
@@ -21,6 +26,26 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
 
   const saveKnowledgeBase = useSaveKnowledgeBase(orgId);
   const crawlWebsite = useCrawlWebsite(orgId);
+  const uploadDoc = useUploadKnowledgeBaseDocument(orgId);
+  const clearKb = useClearKnowledgeBase(orgId);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+
+  const handleFileSelected = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Reset so selecting the same file again still fires onChange.
+    e.target.value = "";
+    if (file) uploadDoc.mutate(file);
+  };
+
+  const handleClearAll = () => {
+    clearKb.mutate(undefined, {
+      onSuccess: () => {
+        setChunks([""]);
+        setConfirmingClear(false);
+      },
+    });
+  };
 
   // Re-sync the editable fields whenever the underlying setup state changes —
   // in particular after a website crawl invalidates and refetches it, so the
@@ -110,6 +135,54 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
         )}
       </div>
 
+      <div className="mb-6 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 p-4">
+        <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">Upload a document</h4>
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+          Upload a PDF, Word (DOCX), or text file — we'll extract the text and add it to the knowledge base.
+        </p>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".pdf,.docx,.txt,.md,.markdown"
+          className="hidden"
+          onChange={handleFileSelected}
+        />
+        <div className="mt-3">
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={() => fileInputRef.current?.click()}
+            isLoading={uploadDoc.isPending}
+          >
+            <FileText className="h-4 w-4" />
+            Choose file
+          </Button>
+        </div>
+
+        {uploadDoc.isPending && (
+          <p className="mt-3 text-sm text-slate-500 dark:text-slate-400">Reading document and building chunks…</p>
+        )}
+
+        {uploadDoc.isSuccess &&
+          (uploadDoc.data.chunks_created > 0 ? (
+            <p className="mt-3 rounded-md bg-emerald-50 dark:bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
+              Added {uploadDoc.data.chunks_created} chunk{uploadDoc.data.chunks_created === 1 ? "" : "s"} from{" "}
+              {uploadDoc.data.filename}.
+            </p>
+          ) : (
+            <p className="mt-3 rounded-md bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+              {uploadDoc.data.errors[0] ?? "No text could be extracted from that file."}
+            </p>
+          ))}
+
+        {uploadDoc.isError && (
+          <p className="mt-3 rounded-md bg-red-50 dark:bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-400">
+            {getErrorMessage(uploadDoc.error)}
+          </p>
+        )}
+      </div>
+
       <form onSubmit={handleSubmit} className="space-y-4">
         <Input label="Knowledge base name" value={name} onChange={(e) => setName(e.target.value)} required />
 
@@ -117,16 +190,54 @@ export function KnowledgeBaseStep({ orgId, setupState, onBack, onNext }: StepCom
           <p className="text-sm font-medium text-slate-700 dark:text-slate-200">
             {chunks.filter((c) => c.trim()).length} chunk{chunks.filter((c) => c.trim()).length === 1 ? "" : "s"}
           </p>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => setIsImportOpen(true)}
-          >
-            <Upload className="h-4 w-4" />
-            Bulk import
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setIsImportOpen(true)}>
+              <Upload className="h-4 w-4" />
+              Bulk import
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => setConfirmingClear(true)}
+              className="text-red-600 hover:bg-red-50 dark:hover:bg-red-500/10"
+            >
+              <Trash2 className="h-4 w-4" />
+              Clear all
+            </Button>
+          </div>
         </div>
+
+        {confirmingClear && (
+          <div className="rounded-lg border border-red-200 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 p-4">
+            <p className="text-sm text-red-700 dark:text-red-300">
+              Delete <span className="font-semibold">all</span> knowledge chunks for this organization (manual,
+              crawled, and uploaded)? This can't be undone.
+            </p>
+            <div className="mt-3 flex gap-2">
+              <Button type="button" variant="danger" size="sm" onClick={handleClearAll} isLoading={clearKb.isPending}>
+                Yes, clear knowledge base
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => setConfirmingClear(false)}
+                disabled={clearKb.isPending}
+              >
+                Cancel
+              </Button>
+            </div>
+            {clearKb.isSuccess && (
+              <p className="mt-2 text-sm text-red-700 dark:text-red-300">
+                Deleted {clearKb.data.chunks_deleted} chunk{clearKb.data.chunks_deleted === 1 ? "" : "s"}.
+              </p>
+            )}
+            {clearKb.isError && (
+              <p className="mt-2 text-sm text-red-600 dark:text-red-400">{getErrorMessage(clearKb.error)}</p>
+            )}
+          </div>
+        )}
 
         <div className="space-y-3">
           {chunks.map((content, index) => (

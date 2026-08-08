@@ -437,7 +437,9 @@ async def process_customer_message(
                 await add_message(db, conversation_id, MessageRole.ai, response_text, conversation.channel)
                 return response_text
 
-        response_text = await generate_response(db, org_id, intent, chunks, history, contact_name)
+        response_text = await generate_response(
+            db, org_id, intent, chunks, history, contact_name, reply_channel=reply_channel
+        )
 
     # h. Save AI response
     await add_message(db, conversation_id, MessageRole.ai, response_text, conversation.channel)

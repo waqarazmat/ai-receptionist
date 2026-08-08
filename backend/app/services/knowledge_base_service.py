@@ -1,18 +1,115 @@
 import re
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.embeddings import embed_batch, embed_text
 from app.ai.voice_query_cache import invalidate_org as invalidate_voice_qcache
 from app.models.knowledge_base import KnowledgeBase
 from app.models.knowledge_chunk import KnowledgeChunk
-from app.services.crawler_service import crawl_website
+from app.services.crawler_service import _split_by_length, crawl_website
 
 
 class ChunkNotFoundError(Exception):
     pass
+
+
+# ── Document upload (PDF / DOCX / TXT / MD) ────────────────────────────────────
+SUPPORTED_DOC_EXTENSIONS = (".pdf", ".docx", ".txt", ".md", ".markdown")
+# Fragments shorter than this after splitting are dropped as noise (page
+# numbers, stray headers) — unless the whole document is that short.
+_MIN_DOC_CHUNK_CHARS = 25
+
+
+class UnsupportedDocumentError(Exception):
+    """Uploaded file isn't a supported knowledge-base document type."""
+
+
+def extract_text_from_document(filename: str, data: bytes) -> str:
+    """Plain text from an uploaded document: PDF (pypdf), DOCX (python-docx), or
+    plain text / Markdown. Raises UnsupportedDocumentError for anything else.
+    Imports are lazy so the parser libs aren't loaded unless a doc is uploaded."""
+    import io
+
+    name = (filename or "").lower().strip()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+        parts = [(page.extract_text() or "") for page in reader.pages]
+        return "\n\n".join(p.strip() for p in parts if p.strip())
+
+    if name.endswith(".docx"):
+        import docx  # python-docx
+
+        document = docx.Document(io.BytesIO(data))
+        blocks = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+        # Tables carry real content in these docs (price lists, contact grids),
+        # so flatten each row into a readable line rather than dropping it.
+        for table in document.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                if cells:
+                    blocks.append(" | ".join(cells))
+        return "\n\n".join(blocks)
+
+    if name.endswith((".txt", ".md", ".markdown")):
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    raise UnsupportedDocumentError(
+        f"Unsupported file type: {filename!r}. Supported: PDF, DOCX, TXT, MD."
+    )
+
+
+async def ingest_document(
+    db: AsyncSession, org_id: uuid.UUID, kb_id: uuid.UUID, filename: str, data: bytes
+) -> dict:
+    """Extract text from an uploaded document, split it into chunks, embed, and
+    ADD them to the KB (existing chunks are kept). Returns {chunks_created,
+    errors} — every failure is a soft error string, never a raised exception, so
+    the endpoint can report it cleanly."""
+    try:
+        text = extract_text_from_document(filename, data)
+    except UnsupportedDocumentError as exc:
+        return {"chunks_created": 0, "errors": [str(exc)]}
+    except Exception as exc:  # noqa: BLE001 — a corrupt/locked file must not 500
+        return {"chunks_created": 0, "errors": [f"Could not read {filename!r}: {exc}"]}
+
+    text = text.strip()
+    if not text:
+        return {
+            "chunks_created": 0,
+            "errors": [f"No extractable text in {filename!r} — a scanned/image-only PDF can't be read."],
+        }
+
+    pieces = [p.strip() for p in _split_by_length(text) if len(p.strip()) >= _MIN_DOC_CHUNK_CHARS]
+    if not pieces:  # whole doc shorter than one chunk — keep it as one
+        pieces = [text]
+
+    try:
+        embeddings = embed_batch(pieces)
+    except Exception as exc:  # noqa: BLE001
+        return {"chunks_created": 0, "errors": [f"Embedding failed: {exc}"]}
+
+    for content, embedding in zip(pieces, embeddings, strict=True):
+        db.add(
+            KnowledgeChunk(
+                knowledge_base_id=kb_id,
+                org_id=org_id,
+                content=content,
+                embedding=embedding,
+                metadata_={"source_file": filename},
+            )
+        )
+    await db.commit()
+    await invalidate_voice_qcache(str(org_id))
+    return {"chunks_created": len(pieces), "errors": []}
 
 
 # ── Voice ASR keyword boosting ────────────────────────────────────────────────
@@ -304,6 +401,20 @@ async def bulk_import_chunks(
     await db.commit()
     await invalidate_voice_qcache(str(org_id))
     return {"chunks_created": len(parsed), "errors": errors}
+
+
+async def clear_knowledge_base(db: AsyncSession, org_id: uuid.UUID) -> int:
+    """Delete EVERY knowledge chunk for an org (all sources — manual, crawled,
+    uploaded). The KnowledgeBase container row(s) are kept, so the org still has
+    an empty KB to add to. Returns how many chunks were removed."""
+    count = (
+        await db.execute(select(func.count()).select_from(KnowledgeChunk).where(KnowledgeChunk.org_id == org_id))
+    ).scalar_one()
+    if count:
+        await db.execute(delete(KnowledgeChunk).where(KnowledgeChunk.org_id == org_id))
+        await db.commit()
+        await invalidate_voice_qcache(str(org_id))
+    return int(count)
 
 
 async def get_or_create_org_knowledge_base(
