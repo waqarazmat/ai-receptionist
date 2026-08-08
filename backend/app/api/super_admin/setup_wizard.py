@@ -1,5 +1,4 @@
 import uuid
-from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,11 +36,6 @@ router = APIRouter()
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
-
-
-def _domain_from_url(url: str) -> str:
-    netloc = urlparse(url).netloc
-    return netloc[4:] if netloc.startswith("www.") else netloc
 
 
 async def _run_website_crawl(
@@ -343,7 +337,12 @@ async def crawl_knowledge_base_wizard(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
 
     if body.knowledge_base_id is None:
-        kb = await knowledge_base_service.create_knowledge_base(db, org_id, f"Website - {_domain_from_url(body.url)}")
+        # Crawl into the org's SINGLE primary KB — the same one the file upload
+        # and the wizard's chunk editor read (get_org_knowledge_base_with_chunks
+        # reads .first()). Creating a separate "Website - {domain}" KB here is
+        # what made crawled chunks invisible in the editor (they landed in a KB
+        # the wizard step never displays). One org → one knowledge base.
+        kb = await knowledge_base_service.get_or_create_org_knowledge_base(db, org_id)
     else:
         try:
             kb = await knowledge_base_service.get_knowledge_base(db, org_id, body.knowledge_base_id)
