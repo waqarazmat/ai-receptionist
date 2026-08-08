@@ -194,7 +194,7 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         # normally instead of re-looping "what service?", with the booking session
         # left alive to resume. An explicit request for a human always breaks out.
         booking_active, booking_state = await booking_session_state(conversation_id)
-        route_to_booking = should_route_to_booking(booking_active, booking_state, intent)
+        route_to_booking = should_route_to_booking(booking_active, booking_state, intent, message_text)
 
         if intent == "escalation_request":
             # f. Escalation — abandon any in-progress booking first.

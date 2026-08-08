@@ -403,7 +403,7 @@ async def process_customer_message(
     # session stays alive so they can resume by naming a service/time. An explicit
     # request for a human always breaks out.
     booking_active, booking_state = await booking_session_state(conversation_id)
-    route_to_booking = should_route_to_booking(booking_active, booking_state, intent)
+    route_to_booking = should_route_to_booking(booking_active, booking_state, intent, message_text)
 
     if intent == "escalation_request":
         # f. Escalation — abandon any in-progress booking first.

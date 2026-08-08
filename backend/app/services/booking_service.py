@@ -38,6 +38,34 @@ DETAILS_LOST_MESSAGE = (
 _CANCEL_RE = re.compile(r"\b(cancel|nevermind|never mind|forget it|stop|start over)\b", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# During the service/time-collection steps, a bare answer ("cleaning", "sun 1pm")
+# classifies as faq/off_topic, NOT a booking intent — so to keep the booking alive
+# we route any non-question reply back into the FSM and only let a genuine question
+# break out to be answered normally (see should_route_to_booking). These detect the
+# "genuine question" vs "scheduling answer" cases.
+_QUESTION_RE = re.compile(
+    r"\?\s*$|^\s*(what|where|when|how|why|which|who|whose|do|does|did|can|could|"
+    r"would|will|is|are|am|may|should)\b",
+    re.IGNORECASE,
+)
+_SCHEDULING_RE = re.compile(
+    r"\b(mon|tue|wed|thu|fri|sat|sun)\w*\b|"
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b|"
+    r"\b(today|tomorrow|tonight|morning|afternoon|evening|noon|midday|midnight)\b|"
+    r"\b(next|this)\s+(week|month|mon|tue|wed|thu|fri|sat|sun)\w*\b|"
+    r"\b\d{1,2}\s*(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.|o'?clock)\b|"
+    r"\b\d{1,2}(st|nd|rd|th)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_question(text: str) -> bool:
+    return bool(_QUESTION_RE.search(text or ""))
+
+
+def _looks_like_scheduling_answer(text: str) -> bool:
+    return bool(_SCHEDULING_RE.search(text or ""))
+
 
 def _is_valid_email(email: str | None) -> bool:
     return bool(email) and bool(_EMAIL_RE.match(email))
@@ -242,7 +270,9 @@ STICKY_BOOKING_STATES = (BookingState.COLLECTING_CONTACT_INFO, BookingState.CONF
 _BOOKING_INTENTS = ("booking_request", "booking_info")
 
 
-def should_route_to_booking(booking_active: bool, booking_state: BookingState, intent: str) -> bool:
+def should_route_to_booking(
+    booking_active: bool, booking_state: BookingState, intent: str, message_text: str = ""
+) -> bool:
     """Whether a customer message should be handled by the booking FSM (vs
     answered normally by RAG). Escalation is decided by the caller before this.
 
@@ -250,13 +280,24 @@ def should_route_to_booking(booking_active: bool, booking_state: BookingState, i
     - While a booking is mid-flow, the sticky states (collecting name/email, or
       confirming) route in even for off_topic/faq-looking messages, because those
       answers ("John", "john@x.com", "yes") classify that way.
-    - In the earlier service/time-collection states, a non-booking message
-      (a question, greeting, farewell) does NOT route in — it's answered normally
-      so the customer isn't trapped re-hearing "what service?" / "what time?".
+    - In the earlier service/time-collection states, a bare answer ("cleaning",
+      "sun 1pm") also classifies as faq/off_topic — so we keep the booking alive
+      for any reply that looks like a scheduling answer OR simply isn't a question,
+      and let ONLY a genuine question ("do you take insurance?") break out to be
+      answered normally, so the customer is neither trapped re-hearing "what time?"
+      nor silently dropped out of the booking when they answer it.
     """
     if intent in _BOOKING_INTENTS:
         return True
-    return booking_active and booking_state in STICKY_BOOKING_STATES
+    if not booking_active:
+        return False
+    if booking_state in STICKY_BOOKING_STATES:
+        return True
+    if booking_state in (BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
+        if _looks_like_scheduling_answer(message_text):
+            return True
+        return not _looks_like_question(message_text)
+    return False
 
 
 async def booking_session_state(conversation_id: uuid.UUID) -> tuple[bool, BookingState]:
