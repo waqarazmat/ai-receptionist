@@ -9,7 +9,9 @@ OTP_REQUEST_WINDOW_SECONDS = 3600
 MAX_OTP_ATTEMPTS_PER_CODE = 3
 OTP_ATTEMPT_WINDOW_SECONDS = 600
 
-DEFAULT_MAX_MESSAGES_PER_HOUR = 500
+# Configurable (env: MESSAGE_RATE_LIMIT_PER_HOUR) so the cap can be tuned per
+# deployment — and raised for load testing — without a code change. Default 500.
+DEFAULT_MAX_MESSAGES_PER_HOUR = settings.MESSAGE_RATE_LIMIT_PER_HOUR
 MESSAGE_COUNT_WINDOW_SECONDS = 3600
 
 

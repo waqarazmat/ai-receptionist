@@ -1,0 +1,4 @@
+# Load-test harness deps (install into your backend venv or a separate one).
+locust>=2.31
+python-socketio[client]>=5.11
+websocket-client>=1.8

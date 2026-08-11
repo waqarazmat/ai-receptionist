@@ -14,7 +14,15 @@ def _to_async_dsn(dsn: str) -> str:
     return dsn
 
 
-engine = create_async_engine(_to_async_dsn(settings.DATABASE_URL), pool_pre_ping=True)
+engine = create_async_engine(
+    _to_async_dsn(settings.DATABASE_URL),
+    pool_pre_ping=True,
+    # Explicit but equal to SQLAlchemy's defaults (5 + 10 overflow, 30s wait) so
+    # behavior is unchanged until tuned via env for multi-worker deployments.
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_timeout=settings.DB_POOL_TIMEOUT,
+)
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 

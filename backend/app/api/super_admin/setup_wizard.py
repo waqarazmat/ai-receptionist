@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_admin_db_session, require_super_admin
 from app.channels.voice import retell_provisioner
+from app.models.enums import ApiKeyProvider
 from app.models.user import User
 from app.schemas.knowledge_base import (
     BulkImportRequest,
@@ -28,7 +29,7 @@ from app.schemas.setup_wizard import (
     WhatsappConfigStep,
     WorkingHoursStep,
 )
-from app.services import knowledge_base_service, org_service, setup_wizard_service
+from app.services import api_key_service, knowledge_base_service, org_service, setup_wizard_service
 from app.services.audit_service import log_action
 
 router = APIRouter()
@@ -199,9 +200,12 @@ async def save_voice_config(
     # already saved above; we just warn so it can be set by hand if needed.
     org = await org_service.get_organization(db, org_id)
     keywords = await knowledge_base_service.build_boosted_keywords(db, org_id, org.name)
+    org_retell_key = await api_key_service.get_org_api_key(db, org_id, ApiKeyProvider.retell)
     result: dict = {"retell_agent_id": agent_id, "provisioned": False}
     try:
-        provision = await retell_provisioner.provision_agent(str(org_id), agent_id, boosted_keywords=keywords)
+        provision = await retell_provisioner.provision_agent(
+            str(org_id), agent_id, boosted_keywords=keywords, api_key=org_retell_key
+        )
         result["provisioned"] = True
         result["llm_websocket_url"] = provision["llm_websocket_url"]
         result["webhook_url"] = provision["webhook_url"]

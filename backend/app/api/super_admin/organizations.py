@@ -8,8 +8,10 @@ from app.ai.prompts.receptionist_system import get_system_prompt
 from app.api.deps import get_admin_db_session, require_super_admin
 from app.channels.voice import retell_provisioner
 from app.config import settings
+from app.models.enums import ApiKeyProvider
 from app.models.organization import Organization
 from app.models.user import User
+from app.services import api_key_service
 from app.schemas.organization import (
     OrgChannelStatusResponse,
     OrgEraseRequest,
@@ -131,9 +133,12 @@ async def reprovision_voice_agent(
 
     org = await db.get(Organization, org_id)
     keywords = await knowledge_base_service.build_boosted_keywords(db, org_id, org.name if org else None)
+    org_retell_key = await api_key_service.get_org_api_key(db, org_id, ApiKeyProvider.retell)
     result: dict = {"retell_agent_id": agent_id, "provisioned": False}
     try:
-        provision = await retell_provisioner.provision_agent(str(org_id), agent_id, boosted_keywords=keywords)
+        provision = await retell_provisioner.provision_agent(
+            str(org_id), agent_id, boosted_keywords=keywords, api_key=org_retell_key
+        )
         result["provisioned"] = True
         result["llm_websocket_url"] = provision["llm_websocket_url"]
         result["webhook_url"] = provision["webhook_url"]
@@ -172,8 +177,11 @@ async def create_voice_agent(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
 
     keywords = await knowledge_base_service.build_boosted_keywords(db, org_id, org.name)
+    org_retell_key = await api_key_service.get_org_api_key(db, org_id, ApiKeyProvider.retell)
     try:
-        created = await retell_provisioner.create_agent(str(org_id), org.name, boosted_keywords=keywords)
+        created = await retell_provisioner.create_agent(
+            str(org_id), org.name, boosted_keywords=keywords, api_key=org_retell_key
+        )
     except retell_provisioner.RetellProvisioningError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not create Retell agent: {exc}")
 
@@ -214,10 +222,11 @@ async def create_voice_web_call(
     to start a browser call — no Retell dashboard login required, so any
     super admin can test regardless of whose Retell account is configured.
     """
-    if not settings.RETELL_API_KEY:
+    org_retell_key = await api_key_service.get_org_api_key(db, org_id, ApiKeyProvider.retell)
+    if not (org_retell_key or settings.RETELL_API_KEY):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="RETELL_API_KEY is not configured on this platform.",
+            detail="No Retell API key configured for this organization or platform.",
         )
 
     try:
@@ -236,7 +245,7 @@ async def create_voice_web_call(
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 "https://api.retellai.com/v2/create-web-call",
-                headers={"Authorization": f"Bearer {settings.RETELL_API_KEY}"},
+                headers={"Authorization": f"Bearer {org_retell_key or settings.RETELL_API_KEY}"},
                 json={"agent_id": agent_id},
             )
     except httpx.HTTPError as exc:

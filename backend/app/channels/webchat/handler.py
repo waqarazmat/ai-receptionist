@@ -1,9 +1,10 @@
+import time
 import uuid
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.embeddings import embed_text
+from app.ai.embeddings import embed_text_async
 from app.ai.llm_router import LLMProviderError, stream_llm_with_fallback
 from app.ai.message_analyzer import analyze_message
 from app.ai.rag_pipeline import hybrid_search
@@ -141,6 +142,12 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
     if not message_text:
         return
 
+    # Per-stage timing (analyze / embed / RAG / time-to-first-token / total) so a
+    # load test's numbers are interpretable from one `message_timing` log line —
+    # a bad number then doesn't force a re-run just to see where the time went.
+    t_start = time.monotonic()
+    timings: dict = {}
+
     async with async_session_maker() as db:
         conversation = await _resolve_conversation(db, sid, session)
         if conversation is None:
@@ -170,7 +177,9 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         ]
 
         # a+c. Combined safety check + intent classification (single LLM call).
+        _t = time.monotonic()
         analysis = await analyze_message(db, message_text, history, org_id)
+        timings["analyze_ms"] = round((time.monotonic() - _t) * 1000)
 
         # b. Save customer message (also notifies the staff inbox)
         await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.webchat)
@@ -212,6 +221,10 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
             )
             await add_message(db, conversation_id, MessageRole.ai, response_text, Channel.webchat)
             await _send_complete_reply(sid, response_text)
+            logger.info(
+                "message_timing", channel="webchat", org_id=str(org_id), intent=intent,
+                total_ms=round((time.monotonic() - t_start) * 1000), **timings,
+            )
             return
 
         if intent == "off_topic":
@@ -226,14 +239,22 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         # d. FAQ (and greeting/farewell) — RAG + streamed generation
         chunks = []
         if intent == "faq":
-            query_embedding = embed_text(message_text)
+            _t = time.monotonic()
+            query_embedding = await embed_text_async(message_text)
+            timings["embed_ms"] = round((time.monotonic() - _t) * 1000)
+            _t = time.monotonic()
             chunks = await hybrid_search(db, org_id, message_text, query_embedding)
+            timings["rag_ms"] = round((time.monotonic() - _t) * 1000)
             if not chunks:
                 await create_escalation(
                     db, org_id, conversation_id, reason=f"No confident answer found for: {message_text}"
                 )
                 await add_message(db, conversation_id, MessageRole.ai, ESCALATION_MESSAGE, Channel.webchat)
                 await _send_complete_reply(sid, ESCALATION_MESSAGE)
+                logger.info(
+                    "message_timing", channel="webchat", org_id=str(org_id), intent="faq_no_match",
+                    total_ms=round((time.monotonic() - t_start) * 1000), **timings,
+                )
                 return
 
         plan = await build_generation_plan(db, org_id, intent, chunks, history, contact_name)
@@ -241,11 +262,18 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         if plan.shortcut_text is not None:
             await add_message(db, conversation_id, MessageRole.ai, plan.shortcut_text, Channel.webchat)
             await _send_complete_reply(sid, plan.shortcut_text)
+            logger.info(
+                "message_timing", channel="webchat", org_id=str(org_id), intent=intent, shortcut=True,
+                total_ms=round((time.monotonic() - t_start) * 1000), **timings,
+            )
             return
 
         collected: list[str] = []
+        ttft_ms: int | None = None
         try:
             async for token in stream_llm_with_fallback(plan.clients, plan.messages, plan.system_prompt):
+                if ttft_ms is None:
+                    ttft_ms = round((time.monotonic() - t_start) * 1000)
                 collected.append(token)
                 await sio.emit("response_token", {"token": token}, to=sid, namespace="/chat")
         except LLMProviderError as exc:
@@ -257,6 +285,10 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
         full_text = "".join(collected)
         await add_message(db, conversation_id, MessageRole.ai, full_text, Channel.webchat)
         await sio.emit("response_complete", {}, to=sid, namespace="/chat")
+        logger.info(
+            "message_timing", channel="webchat", org_id=str(org_id), intent=intent,
+            ttft_ms=ttft_ms, total_ms=round((time.monotonic() - t_start) * 1000), **timings,
+        )
 
 
 @sio.on("disconnect", namespace="/chat")

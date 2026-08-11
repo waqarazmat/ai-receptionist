@@ -1,4 +1,6 @@
+import asyncio
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 # Cap native thread pools BEFORE importing torch / sentence-transformers, so
 # OpenMP/MKL/OpenBLAS read the caps at C-library init time (they only honor
@@ -100,3 +102,31 @@ def embed_text(text: str) -> list[float]:
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
     return _get_model().encode(texts).tolist()
+
+
+_executor: ThreadPoolExecutor | None = None
+
+
+def _embed_executor() -> ThreadPoolExecutor:
+    global _executor
+    if _executor is None:
+        # A dedicated, bounded pool for embedding inference. See
+        # EMBEDDING_MAX_CONCURRENCY in config for why it's bounded rather than
+        # using asyncio.to_thread's default (up to 32) executor: concurrent
+        # encodes fan out across cores (encode() releases the GIL during the
+        # native forward pass) without oversubscribing an ~8-vCPU container.
+        _executor = ThreadPoolExecutor(
+            max_workers=settings.EMBEDDING_MAX_CONCURRENCY, thread_name_prefix="embed"
+        )
+    return _executor
+
+
+async def embed_text_async(text: str) -> list[float]:
+    """Async wrapper for embed_text. Offloads the synchronous, CPU-bound
+    model.encode() to a bounded threadpool so it NEVER blocks the event loop —
+    without this, a single embed stalls every other request/stream/socket ping
+    on that worker (the web-chat/WhatsApp hot path). Request handlers must use
+    this; embed_text stays for sync contexts (ingestion, scripts, tests).
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_embed_executor(), embed_text, text)

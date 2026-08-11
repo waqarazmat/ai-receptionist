@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -78,16 +79,50 @@ def _build_sdk(provider: ApiKeyProvider, api_key: str) -> Any:
     if provider == ApiKeyProvider.anthropic:
         from anthropic import AsyncAnthropic
 
-        return AsyncAnthropic(api_key=api_key)
+        # Explicit timeout: the SDK defaults to ~10 min, which would hang a request
+        # (and cascade under load) if the provider is slow or rate-limiting.
+        return AsyncAnthropic(api_key=api_key, timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS)
     if provider == ApiKeyProvider.openai:
         from openai import AsyncOpenAI
 
-        return AsyncOpenAI(api_key=api_key)
+        return AsyncOpenAI(api_key=api_key, timeout=settings.LLM_REQUEST_TIMEOUT_SECONDS)
     if provider == ApiKeyProvider.cohere:
         from cohere import AsyncClient
 
         return AsyncClient(api_key=api_key)
     raise ValueError(f"Unsupported provider: {provider}")
+
+
+# ── LOAD-TEST MOCK (settings.LOAD_TEST_MOCK_LLM) ──────────────────────────────
+# A single dummy client + canned responses, so a load test exercises the real
+# infra (Socket.IO / embeddings / pgvector / Redis / DB) with zero LLM calls.
+_MOCK_CLIENT = OrgLLMClient(provider=ApiKeyProvider.anthropic, model="mock", api_key="mock", sdk=None)
+_MOCK_REPLY = (
+    "Thanks for your message! We're open Monday to Friday, nine to five, and I'm happy "
+    "to help you book an appointment or answer any questions about our services."
+)
+_MOCK_BOOKING_RE = re.compile(r"\b(book|booking|appointment|schedule|reserve)\b", re.IGNORECASE)
+
+
+def _mock_call_llm(system_prompt: str, messages: list[dict]) -> str:
+    """Canned non-streaming reply shaped to the caller's prompt, so intent
+    classification and the booking/contact extractors get parseable JSON."""
+    last = (messages[-1]["content"] if messages else "") or ""
+    if system_prompt.startswith("You analyze the customer's latest message"):
+        intent = "booking_request" if _MOCK_BOOKING_RE.search(last) else "faq"
+        return f'{{"is_safe": true, "safety_reason": null, "intent": "{intent}", "confidence": 0.95}}'
+    if "extract appointment-booking details" in system_prompt:
+        return '{"service": null, "date": null, "time": null}'
+    if "extract the customer's name and email" in system_prompt:
+        return '{"name": "Load Test", "email": "load@test.local"}'
+    return _MOCK_REPLY
+
+
+async def _mock_stream() -> AsyncIterator[str]:
+    """Canned streamed reply — yields word-by-word to mimic token streaming
+    without any sleep, so the harness measures raw pipeline throughput."""
+    for word in _MOCK_REPLY.split():
+        yield word + " "
 
 
 async def get_org_llm_clients(
@@ -99,6 +134,9 @@ async def get_org_llm_clients(
     primary provider errors before the first token. Callers that only need
     the primary can still use get_org_llm_client() which is a thin wrapper.
     """
+    if settings.LOAD_TEST_MOCK_LLM:
+        return [_MOCK_CLIENT]
+
     result = await db.execute(
         select(OrgApiKey).where(
             OrgApiKey.org_id == org_id,
@@ -202,6 +240,9 @@ async def call_llm(client: OrgLLMClient, messages: list[dict], system_prompt: st
     """Unified call across providers. Raises LLMProviderError on any failure —
     it does not crash the process, but it also doesn't silently return text,
     so callers can decide how to degrade for the customer."""
+    if settings.LOAD_TEST_MOCK_LLM:
+        return _mock_call_llm(system_prompt, messages)
+
     handler = _PROVIDER_HANDLERS.get(client.provider)
     if handler is None:
         raise LLMProviderError(f"Unsupported provider: {client.provider}")
@@ -212,6 +253,37 @@ async def call_llm(client: OrgLLMClient, messages: list[dict], system_prompt: st
     except Exception as exc:
         logger.warning("llm_call_failed", provider=client.provider.value, model=client.model, error=str(exc))
         raise LLMProviderError(f"{client.provider.value} call failed: {exc}") from exc
+
+
+async def call_llm_with_fallback(
+    clients: list[OrgLLMClient], messages: list[dict], system_prompt: str
+) -> str:
+    """Non-streaming multi-provider variant of call_llm: try each client in
+    priority order, falling back to the next on a provider error.
+
+    The fast tier (intent classification + booking/contact extraction) previously
+    used a single client with NO fallback, unlike quality-tier generation
+    (stream_llm_with_fallback). That asymmetry is exactly why a single bad
+    provider key silently broke intent + booking while generation — which fell
+    back to the org's other provider — looked fine. This closes that gap.
+    """
+    if not clients:
+        raise NoLLMProviderConfiguredError("call_llm_with_fallback called with no clients")
+
+    last_error: Exception | None = None
+    for idx, client in enumerate(clients):
+        try:
+            return await call_llm(client, messages, system_prompt)
+        except LLMProviderError as exc:
+            last_error = exc
+            logger.warning(
+                "llm_call_fallback_attempt",
+                provider=client.provider.value,
+                attempt=idx + 1,
+                fallback=idx > 0,
+                error=str(exc),
+            )
+    raise last_error or LLMProviderError("all fast-tier providers failed")
 
 
 async def _stream_anthropic(client: OrgLLMClient, messages: list[dict], system_prompt: str) -> AsyncIterator[str]:
@@ -324,6 +396,11 @@ async def stream_llm_with_fallback(
     outage per year exposed to end users. With fallback the outages have to
     line up in the same 30s window.
     """
+    if settings.LOAD_TEST_MOCK_LLM:
+        async for token in _mock_stream():
+            yield token
+        return
+
     if not clients:
         raise NoLLMProviderConfiguredError("stream_llm_with_fallback called with no clients")
 

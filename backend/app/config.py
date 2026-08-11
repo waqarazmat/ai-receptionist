@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/app/config.py -> repo root .env (backend/ has no .env of its own)
@@ -29,6 +30,37 @@ class Settings(BaseSettings):
     # which truncates our longer KB chunks (~800 chars); widen it so chunk tails
     # aren't lost. Never narrowed below the model's own default.
     EMBEDDING_MAX_SEQ_LENGTH: int = 256
+    # Max concurrent embed_text_async() calls. The synchronous model.encode() is
+    # offloaded to a bounded threadpool so it never blocks the event loop; this
+    # caps how many run at once. Bounded on purpose — os.cpu_count() over-reports
+    # on Railway (host cores, not the container quota), so an unbounded pool would
+    # oversubscribe the CPU. Small enough to leave headroom for the loop + DB I/O.
+    EMBEDDING_MAX_CONCURRENCY: int = 4
+
+    # Per-org message cap per hour (Redis-counted). Beyond it, a static fallback
+    # is returned instead of calling the LLM. Env-tunable so it can be raised for
+    # load testing or per-deployment tuning without a code change.
+    MESSAGE_RATE_LIMIT_PER_HOUR: int = 500
+
+    # ── Load / resilience knobs (all defaults preserve current behavior) ───────
+    # Overall timeout on every LLM SDK call. Without it the Anthropic/OpenAI SDKs
+    # default to ~10 minutes, so a slow/rate-limited provider call can hang a
+    # request and cascade under load. 60s is far above a normal 1-3s call.
+    LLM_REQUEST_TIMEOUT_SECONDS: float = 60.0
+    # DB connection pool. Defaults equal SQLAlchemy's own defaults, so behavior is
+    # unchanged until tuned. When running multiple web workers, ensure
+    # workers * (DB_POOL_SIZE + DB_MAX_OVERFLOW) stays under Postgres max_connections.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+    DB_POOL_TIMEOUT: int = 30
+    # Bounds the Google Calendar free/busy lookup done during slot generation so a
+    # slow Calendar API can't stall bookings — on timeout it degrades exactly like
+    # a Calendar error (falls back to the DB appointment guard).
+    CALENDAR_FREEBUSY_TIMEOUT_SECONDS: float = 5.0
+    # Back the Socket.IO servers with a Redis manager so emits work across multiple
+    # web workers/replicas. MUST be enabled before running WEB_CONCURRENCY > 1 (or
+    # multiple replicas) or cross-worker delivery breaks. Off = single-worker (current).
+    SOCKETIO_REDIS_MANAGER: bool = False
 
     JWT_SECRET_KEY: str
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
@@ -166,6 +198,12 @@ class Settings(BaseSettings):
     # router's platform fallback. See app/services/api_key_service.py.
     ALLOW_PLATFORM_KEY_FALLBACK: bool = True
 
+    # LOAD-TEST ONLY. When true, the LLM router returns canned responses instead
+    # of calling any provider — so a load test measures OUR infra (Socket.IO,
+    # embeddings, pgvector, Redis, DB) without LLM cost, latency, or rate limits,
+    # and needs no real API keys on the test org. MUST stay False in production.
+    LOAD_TEST_MOCK_LLM: bool = False
+
     # ── WhatsApp Voice Note pipeline (STT + TTS) ───────────────────────────
     # The keys below are PLATFORM-level FALLBACKS only. The pipeline prefers each
     # org's own key (encrypted in org_api_keys: groq for STT, deepgram/openai for
@@ -226,6 +264,46 @@ class Settings(BaseSettings):
     # Guards against accidental loops or deliberate abuse (each note costs
     # you STT + LLM + TTS money).
     VOICE_NOTE_RATE_LIMIT_PER_MINUTE: int = 5
+
+    # ── Fail-fast configuration validation ─────────────────────────────────────
+    # Reject a misconfigured process at startup with a clear message, instead of
+    # a confusing failure deep in a request handler. These validators only REJECT
+    # bad values — they never transform a secret. In particular MASTER_ENCRYPTION_KEY
+    # DERIVES every per-org Fernet key, so trimming or altering it would make all
+    # already-encrypted org API keys undecryptable; it is validated, never touched.
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _check_database_url(cls, v: str) -> str:
+        if not v.strip().startswith(("postgresql://", "postgresql+asyncpg://", "postgres://")):
+            raise ValueError("DATABASE_URL must be a PostgreSQL DSN (postgresql://…)")
+        return v
+
+    @field_validator("REDIS_URL")
+    @classmethod
+    def _check_redis_url(cls, v: str) -> str:
+        if not v.strip().startswith(("redis://", "rediss://", "unix://")):
+            raise ValueError("REDIS_URL must be a redis:// or rediss:// URL")
+        return v
+
+    @field_validator("MASTER_ENCRYPTION_KEY", "JWT_SECRET_KEY", "SUPER_ADMIN_EMAIL")
+    @classmethod
+    def _check_required_secret(cls, v: str, info) -> str:
+        if not v or not v.strip():
+            raise ValueError(f"{info.field_name} is required and must not be blank")
+        lowered = v.strip().lower()
+        if any(marker in lowered for marker in ("changeme", "your-", "placeholder", "<")):
+            raise ValueError(f"{info.field_name} looks like a placeholder — set a real value")
+        return v
+
+    @model_validator(mode="after")
+    def _check_production_invariants(self) -> "Settings":
+        # Guardrails that only matter in production — never let the load-test
+        # mock LLM (canned responses, no real calls) ship to a live deployment.
+        if self.APP_ENV == "production" and self.LOAD_TEST_MOCK_LLM:
+            raise ValueError(
+                "LOAD_TEST_MOCK_LLM must be False in production — it returns canned LLM responses"
+            )
+        return self
 
 
 settings = Settings()

@@ -17,13 +17,26 @@ from app.config import settings
 #
 # `transports=None` (the default) leaves both polling and websocket enabled
 # on both servers.
+def _client_manager(channel: str):
+    """A Redis-backed client manager so emits fan out across multiple web
+    workers/replicas; None (default) uses Socket.IO's in-process manager, which
+    is correct and unchanged for a single worker. The two servers use DISTINCT
+    Redis channels so /chat and /inbox pub/sub never cross. Enable via
+    SOCKETIO_REDIS_MANAGER before scaling past one worker."""
+    if settings.SOCKETIO_REDIS_MANAGER:
+        return socketio.AsyncRedisManager(settings.REDIS_URL, channel=channel)
+    return None
+
+
 chat_sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins="*",
+    client_manager=_client_manager("socketio_chat"),
 )
 inbox_sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins=settings.CORS_ORIGINS,
+    client_manager=_client_manager("socketio_inbox"),
 )
 
 

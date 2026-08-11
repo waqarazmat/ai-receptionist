@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.llm_router import PROVIDER_PRIORITY
 from app.channels.voice import retell_provisioner
 from app.config import settings
+from app.services import api_key_service
 from app.models.appointment import Appointment
 from app.models.channel_config import ChannelConfig
 from app.models.contact import Contact
@@ -173,8 +174,11 @@ async def get_channel_status(db: AsyncSession, org_id: uuid.UUID) -> OrgChannelS
     # entirely otherwise so channel status stays fast/offline-safe.
     voice_agent_id = voice_config.get("retell_agent_id")
     voice_provisioned: bool | None = None
-    if voice_agent_id and settings.RETELL_API_KEY:
-        info = await retell_provisioner.verify_agent(voice_agent_id)
+    # Verify against the ORG's own Retell account (its agent lives there); fall
+    # back to the platform key only if the org hasn't configured its own.
+    org_retell_key = await api_key_service.get_org_api_key(db, org_id, ApiKeyProvider.retell)
+    if voice_agent_id and (org_retell_key or settings.RETELL_API_KEY):
+        info = await retell_provisioner.verify_agent(voice_agent_id, api_key=org_retell_key)
         voice_provisioned = retell_provisioner.is_provisioned_for_org(
             str(org_id), info.get("current_llm_url")
         )

@@ -9,7 +9,7 @@ import structlog
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
 
-from app.ai.embeddings import embed_text
+from app.ai.embeddings import embed_text_async
 from app.ai.llm_router import (
     LLMProviderError,
     NoLLMProviderConfiguredError,
@@ -714,7 +714,7 @@ async def _run_rag(org_id: uuid.UUID, call_id: str, message_text: str) -> list:
     )
 
     t0 = time.monotonic()
-    query_embedding = await asyncio.to_thread(embed_text, message_text)
+    query_embedding = await embed_text_async(message_text)
     embed_ms = round((time.monotonic() - t0) * 1000)
     logger.info("voice_embed_ms", org_id=str(org_id), call_id=call_id, latency_ms=embed_ms)
 

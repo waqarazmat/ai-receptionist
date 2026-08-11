@@ -7,8 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.ai.llm_router import (
     LLMProviderError,
     NoLLMProviderConfiguredError,
-    call_llm,
-    get_org_llm_client,
+    call_llm_with_fallback,
+    get_org_llm_clients,
     parse_json_response,
 )
 
@@ -96,9 +96,9 @@ async def analyze_message(
     user_prompt = f"Conversation so far:\n{history_text}\n\nLatest customer message: {text}"
 
     try:
-        client = await get_org_llm_client(db, org_id, model_tier="fast")
-        raw = await call_llm(
-            client,
+        clients = await get_org_llm_clients(db, org_id, model_tier="fast")
+        raw = await call_llm_with_fallback(
+            clients,
             messages=[{"role": "user", "content": user_prompt}],
             system_prompt=ANALYSIS_SYSTEM_PROMPT,
         )

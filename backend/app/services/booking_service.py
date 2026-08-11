@@ -5,7 +5,13 @@ from datetime import date, datetime, timedelta, timezone
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.llm_router import LLMProviderError, NoLLMProviderConfiguredError, call_llm, get_org_llm_client, parse_json_response
+from app.ai.llm_router import (
+    LLMProviderError,
+    NoLLMProviderConfiguredError,
+    call_llm_with_fallback,
+    get_org_llm_clients,
+    parse_json_response,
+)
 from app.ai.prompts.booking_prompts import get_booking_extraction_prompt, get_contact_info_extraction_prompt
 from app.booking import slot_manager
 from app.booking.fsm import BookingFSM, BookingState
@@ -182,9 +188,9 @@ async def _extract_booking_fields(
     db: AsyncSession, org_id: uuid.UUID, message_text: str, service_names: list[str], org_timezone_name: str, org_tz
 ) -> dict:
     try:
-        client = await get_org_llm_client(db, org_id, model_tier="fast")
-        raw = await call_llm(
-            client,
+        clients = await get_org_llm_clients(db, org_id, model_tier="fast")
+        raw = await call_llm_with_fallback(
+            clients,
             messages=[{"role": "user", "content": message_text}],
             system_prompt=get_booking_extraction_prompt(
                 service_names=service_names,
@@ -200,9 +206,9 @@ async def _extract_booking_fields(
 
 async def _extract_contact_info(db: AsyncSession, org_id: uuid.UUID, message_text: str) -> dict:
     try:
-        client = await get_org_llm_client(db, org_id, model_tier="fast")
-        raw = await call_llm(
-            client,
+        clients = await get_org_llm_clients(db, org_id, model_tier="fast")
+        raw = await call_llm_with_fallback(
+            clients,
             messages=[{"role": "user", "content": message_text}],
             system_prompt=get_contact_info_extraction_prompt(),
         )

@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -5,7 +6,7 @@ import structlog
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.embeddings import embed_text
+from app.ai.embeddings import embed_text_async
 from app.ai.message_analyzer import analyze_message
 from app.ai.rag_pipeline import hybrid_search
 from app.ai.response_generator import DEFAULT_OFF_TOPIC_MESSAGE, ESCALATION_MESSAGE, generate_response
@@ -374,12 +375,20 @@ async def process_customer_message(
         return STATIC_RATE_LIMIT_MESSAGE
     await increment_message_count(str(org_id))
 
+    # Per-stage timing so a load test's numbers are interpretable — one
+    # `message_timing` log per message shows where the latency actually went
+    # (classifier vs embed vs RAG vs total), so a bad number doesn't need a re-run.
+    t_start = time.monotonic()
+    timings: dict = {}
+
     history = [
         {"role": m.role.value, "content": m.content} for m in await get_conversation_messages(db, conversation_id)
     ]
 
     # a+c. Combined safety check + intent classification (single LLM call).
+    _t = time.monotonic()
     analysis = await analyze_message(db, message_text, history, org_id)
+    timings["analyze_ms"] = round((time.monotonic() - _t) * 1000)
 
     # b. Save customer message (saved regardless, for the record)
     await add_message(db, conversation_id, MessageRole.customer, message_text, conversation.channel)
@@ -426,8 +435,12 @@ async def process_customer_message(
         # d. FAQ (and greeting/farewell) — RAG + generation
         chunks = []
         if intent == "faq":
-            query_embedding = embed_text(message_text)
+            _t = time.monotonic()
+            query_embedding = await embed_text_async(message_text)
+            timings["embed_ms"] = round((time.monotonic() - _t) * 1000)
+            _t = time.monotonic()
             chunks = await hybrid_search(db, org_id, message_text, query_embedding)
+            timings["rag_ms"] = round((time.monotonic() - _t) * 1000)
             if not chunks:
                 # No confident knowledge match — escalate rather than guess.
                 await create_escalation(
@@ -435,14 +448,25 @@ async def process_customer_message(
                 )
                 response_text = ESCALATION_MESSAGE
                 await add_message(db, conversation_id, MessageRole.ai, response_text, conversation.channel)
+                logger.info(
+                    "message_timing", channel=conversation.channel.value, org_id=str(org_id),
+                    intent="faq_no_match", total_ms=round((time.monotonic() - t_start) * 1000), **timings,
+                )
                 return response_text
 
+        _t = time.monotonic()
         response_text = await generate_response(
             db, org_id, intent, chunks, history, contact_name, reply_channel=reply_channel
         )
+        timings["generate_ms"] = round((time.monotonic() - _t) * 1000)
 
     # h. Save AI response
     await add_message(db, conversation_id, MessageRole.ai, response_text, conversation.channel)
+
+    logger.info(
+        "message_timing", channel=conversation.channel.value, org_id=str(org_id), intent=intent,
+        total_ms=round((time.monotonic() - t_start) * 1000), **timings,
+    )
 
     # i. Return AI response text
     return response_text

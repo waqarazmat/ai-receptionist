@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -7,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.booking.google_calendar import GoogleCalendarClient, GoogleCalendarError
+from app.config import settings
 from app.db.redis import redis_client
 from app.models.appointment import Appointment
 from app.models.enums import AppointmentStatus
@@ -100,9 +102,16 @@ async def _busy_ranges(
 
     try:
         client = await GoogleCalendarClient.for_org(db, org_id)
-        for period in await client.get_free_busy(window_start, window_end):
+        # Bounded so a slow Calendar API can't stall booking replies under load;
+        # on timeout we degrade exactly like a Calendar error below (the DB
+        # appointment guard still prevents double-booking).
+        periods = await asyncio.wait_for(
+            client.get_free_busy(window_start, window_end),
+            timeout=settings.CALENDAR_FREEBUSY_TIMEOUT_SECONDS,
+        )
+        for period in periods:
             ranges.append((datetime.fromisoformat(period["start"]), datetime.fromisoformat(period["end"])))
-    except GoogleCalendarError as exc:
+    except (GoogleCalendarError, asyncio.TimeoutError) as exc:
         logger.warning("calendar_unavailable_for_slots", org_id=str(org_id), error=str(exc))
 
     appt_rows = (

@@ -78,11 +78,17 @@ def is_provisioned_for_org(org_id: str, current_llm_url: str | None) -> bool:
     return current_llm_url.rstrip("/") == build_llm_websocket_url(org_id).rstrip("/")
 
 
-def _auth_headers() -> dict[str, str]:
-    return {"Authorization": f"Bearer {settings.RETELL_API_KEY}"}
+def _auth_headers(api_key: str | None = None) -> dict[str, str]:
+    # Prefer the org's OWN Retell key (its agent lives in that account); fall back
+    # to the platform key only when the org has none. Passing the platform key for
+    # an agent that lives in a different (per-org) Retell account is exactly what
+    # made "provision"/"create"/"test" fail with 404s.
+    return {"Authorization": f"Bearer {api_key or settings.RETELL_API_KEY}"}
 
 
-async def create_agent(org_id: str, org_name: str, boosted_keywords: list[str] | None = None) -> dict:
+async def create_agent(
+    org_id: str, org_name: str, boosted_keywords: list[str] | None = None, api_key: str | None = None
+) -> dict:
     """Create a brand-new Retell agent wired to this backend from scratch, so we
     control the full config instead of relying on a hand-made agent.
 
@@ -96,7 +102,7 @@ async def create_agent(org_id: str, org_name: str, boosted_keywords: list[str] |
     IS the LLM, served over a WebSocket. "retell-llm" would reference a
     Retell-hosted LLM by llm_id and ignore our llm_websocket_url entirely.
     """
-    if not settings.RETELL_API_KEY:
+    if not (api_key or settings.RETELL_API_KEY):
         raise RetellProvisioningError(
             "RETELL_API_KEY is not configured on the backend, so a Retell agent "
             "can't be created automatically."
@@ -120,7 +126,7 @@ async def create_agent(org_id: str, org_name: str, boosted_keywords: list[str] |
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.post(url, json=payload, headers=_auth_headers())
+            response = await client.post(url, json=payload, headers=_auth_headers(api_key))
     except httpx.HTTPError as exc:
         logger.warning("retell_create_network_error", org_id=org_id, error=str(exc))
         raise RetellProvisioningError(f"Could not reach Retell's API: {exc}") from exc
@@ -153,14 +159,14 @@ async def create_agent(org_id: str, org_name: str, boosted_keywords: list[str] |
 
 
 async def provision_agent(
-    org_id: str, retell_agent_id: str, boosted_keywords: list[str] | None = None
+    org_id: str, retell_agent_id: str, boosted_keywords: list[str] | None = None, api_key: str | None = None
 ) -> dict:
     """Point a Retell agent's Custom LLM URL and webhook URL at this backend.
 
     Returns the updated agent config plus the URLs we set. Raises
     RetellProvisioningError on any failure so the caller can save the agent id
     anyway and surface a warning."""
-    if not settings.RETELL_API_KEY:
+    if not (api_key or settings.RETELL_API_KEY):
         raise RetellProvisioningError(
             "RETELL_API_KEY is not configured on the backend, so the agent's "
             "Custom LLM URL can't be set automatically."
@@ -187,7 +193,7 @@ async def provision_agent(
 
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.patch(url, json=payload, headers=_auth_headers())
+            response = await client.patch(url, json=payload, headers=_auth_headers(api_key))
     except httpx.HTTPError as exc:
         logger.warning("retell_provision_network_error", org_id=org_id, agent_id=retell_agent_id, error=str(exc))
         raise RetellProvisioningError(f"Could not reach Retell's API: {exc}") from exc
@@ -217,7 +223,7 @@ async def provision_agent(
     }
 
 
-async def verify_agent(retell_agent_id: str) -> dict:
+async def verify_agent(retell_agent_id: str, api_key: str | None = None) -> dict:
     """Read an agent's current config from Retell to check it exists and where
     its Custom LLM URL / webhook currently point.
 
@@ -226,13 +232,13 @@ async def verify_agent(retell_agent_id: str) -> dict:
     reports the agent as unverifiable rather than breaking the page."""
     unknown = {"exists": False, "current_llm_url": None, "current_webhook_url": None}
 
-    if not settings.RETELL_API_KEY:
+    if not (api_key or settings.RETELL_API_KEY):
         return {**unknown, "error": "RETELL_API_KEY is not configured"}
 
     url = f"{RETELL_API_BASE}/get-agent/{retell_agent_id}"
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(url, headers=_auth_headers())
+            response = await client.get(url, headers=_auth_headers(api_key))
     except httpx.HTTPError as exc:
         logger.warning("retell_verify_network_error", agent_id=retell_agent_id, error=str(exc))
         return {**unknown, "error": str(exc)}
