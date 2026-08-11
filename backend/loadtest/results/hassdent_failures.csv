@@ -1,3 +1,0 @@
-Method,Name,Error,Occurrences,First Seen,Last Seen
-ws,faq:complete,TimeoutError('no response_complete in 30.0s'),2,2026-08-09T06:43:55Z,2026-08-09T06:43:55Z
-ws,booking:complete,TimeoutError('no response_complete in 30.0s'),10,2026-08-09T06:43:52Z,2026-08-09T06:43:55Z
