@@ -41,5 +41,8 @@ Thumbs.db
 *~
 .idea/
 
+# Load test - keep the harness, ignore generated result CSVs
+backend/loadtest/results/
+
 # Claude Code - keep shared project config, ignore local overrides
 .claude/settings.local.json

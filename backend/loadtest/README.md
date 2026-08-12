@@ -68,3 +68,53 @@ python loadtest/cleanup.py <ORG_ID>
 ```
 Deletes only that org's conversations/messages and the `Web Visitor` contacts the
 harness created.
+
+---
+
+# Question-driven capture (`qa_capture.py`)
+
+Same load engine, different goal: instead of canned scenarios, it sends **your own
+questions** (from a CSV) and saves **every bot answer** to an output CSV. No grading
+is done — you review the answers yourself. A question asked 300 times under load
+produces 300 rows with that id, so you can see if the answer drifts when the system
+is busy.
+
+**This is the harness wired for Hassdent** (default `LOADTEST_ORG_ID`).
+
+### 1. Put your questions in `loadtest/questions.csv`
+A `question` column is required; `id` is optional (rows are auto-numbered if absent).
+Extra columns (e.g. your own `expected_answer`) are ignored, so keep your answer key
+in the same file if you like.
+```csv
+id,question,expected_answer
+1,What are your opening hours?,
+2,Do you offer teeth whitening?,
+```
+
+### 2. Run the backend with REAL answers
+Leave `LOAD_TEST_MOCK_LLM` **unset** (mock mode returns a fixed string, so every
+"answer" would be identical). The target org must have a working LLM key or replies
+fall back to the static line.
+```bash
+# from backend/  — use the project venv that has locust:
+.venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### 3. Run the capture
+```bash
+# Hassdent is the default org; override LOADTEST_ORG_ID for another org.
+.venv/Scripts/python.exe -m locust -f loadtest/qa_capture.py --host http://localhost:8000
+```
+Open http://localhost:8089, set users + spawn rate, and run. Or headless:
+```bash
+.venv/Scripts/python.exe -m locust -f loadtest/qa_capture.py --host http://localhost:8000 \
+  --headless -u 100 -r 10 -t 3m
+```
+
+### 4. Read the output
+`loadtest/results/qa_capture.csv` — columns `id, question, response,
+response_time_ms, ttft_ms, status`, **sorted by id** so all rows for a question sit
+together. `status` is `ok` / `timeout` / `empty`. Written live (safe if you Ctrl-C),
+re-sorted when the run stops.
+
+Override paths with `QUESTIONS_FILE` and `OUTPUT_FILE` env vars.

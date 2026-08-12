@@ -12,6 +12,36 @@ class ContactNotFoundError(Exception):
     pass
 
 
+# Caller-ID values that mean "no real number" — a withheld/blocked caller ID or a
+# web/test call (Retell sends `from_number` absent → the caller defaults it to
+# "unknown"). These must NEVER be used to match an existing contact: each such
+# call is a different person, so matching them all to one shared "unknown"
+# contact would leak one caller's name/history into the next caller's session.
+ANONYMOUS_PHONE_SENTINELS = frozenset(
+    {"", "unknown", "anonymous", "restricted", "private", "withheld", "blocked", "no-caller-id"}
+)
+
+
+def is_anonymous_number(phone: str | None) -> bool:
+    """True when `phone` carries no usable caller identity (see the sentinel set)."""
+    return not phone or phone.strip().lower() in ANONYMOUS_PHONE_SENTINELS
+
+
+async def create_anonymous_contact(db: AsyncSession, org_id: uuid.UUID, channel: Channel) -> Contact:
+    """A fresh, UNSHARED contact for a call/message with no usable caller ID.
+
+    Phone is stored NULL so it can never be matched by
+    `get_or_create_contact_by_phone` — that is the whole point: two different
+    anonymous callers must get two different contacts, never the single shared
+    "unknown" contact (which would leak the first caller's name/history to the
+    second)."""
+    contact = Contact(org_id=org_id, name="unknown", phone=None, channel=channel)
+    db.add(contact)
+    await db.commit()
+    await db.refresh(contact)
+    return contact
+
+
 async def get_or_create_contact_by_phone(
     db: AsyncSession, org_id: uuid.UUID, phone: str, channel: Channel, name: str | None = None
 ) -> Contact:
@@ -20,7 +50,15 @@ async def get_or_create_contact_by_phone(
     identity to match an existing contact against. Scoped per-org AND
     per-channel: Contact.channel is a single non-null column, so the same
     phone number calling in on voice and messaging on WhatsApp is
-    deliberately two separate Contact rows, not one shared across channels."""
+    deliberately two separate Contact rows, not one shared across channels.
+
+    Callers with no real caller ID must NOT be routed here — use
+    `create_anonymous_contact` instead (see `is_anonymous_number`), or every
+    anonymous caller collapses onto one shared contact and leaks data. As a
+    safety net this also refuses to match on a sentinel phone value."""
+    if is_anonymous_number(phone):
+        return await create_anonymous_contact(db, org_id, channel)
+
     contact = (
         await db.execute(
             select(Contact).where(Contact.org_id == org_id, Contact.phone == phone, Contact.channel == channel)
