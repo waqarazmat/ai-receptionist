@@ -1,6 +1,5 @@
 import asyncio
 import json
-import random
 import re
 import time
 import uuid
@@ -153,13 +152,6 @@ ws_router = APIRouter()
 
 RAG_TOP_K = 3
 VOICE_REMINDER_TEXT = "Are you still there? I'm happy to keep helping whenever you're ready."
-
-# Instant filler that goes on the wire the moment we know a turn started, so
-# Retell's TTS has something to speak while we run rate-limit / RAG / LLM. It's
-# sent with content_complete=False under the same response_id as the real
-# answer, so Retell concatenates it into a single utterance (no double-speak).
-# Trailing space matters: TTS runs "Mm-hmm," and the streamed answer together.
-_FILLERS = ["Mm-hmm, ", "Let's see, ", "One moment, "]
 
 # ── End-call detection ────────────────────────────────────────────────────────
 #
@@ -456,6 +448,104 @@ def _resume_line(language: str) -> str:
     return _LANG_SWITCH_TEXT.get(language, _LANG_SWITCH_TEXT["en"])["resume"]
 
 
+# ── Multilingual intro-first opening + automatic language mirroring ───────────
+#
+# For orgs that support more than one language, the caller now hears a short
+# introduction spoken in EACH supported language (capped, see below), followed
+# by an invitation to simply continue in whichever language they prefer. From
+# then on the LLM mirrors the caller's language automatically — no IVR menu, no
+# "press 1 for English". The old on-demand menu still exists as a manual
+# override (a caller can say "can you switch to French"), but the default,
+# expected path is: speak your language, and the assistant speaks it back.
+
+# Human-readable language names, used to tell the LLM which languages to expect
+# in the mirroring instruction. Falls back to the raw ISO code if unlisted.
+_LANG_ENGLISH_NAME: dict[str, str] = {
+    "en": "English", "nl": "Dutch", "fr": "French", "de": "German", "es": "Spanish",
+    "it": "Italian", "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish", "ur": "Urdu",
+    "hi": "Hindi", "zh": "Chinese", "ru": "Russian", "pl": "Polish",
+}
+
+# Per-language intro copy for the multilingual opening. `greeting` takes the org
+# name; `choose_prompt` asks which language the caller would like — it takes the
+# {langs} list of available languages, AND invites the caller to just ask their
+# question, so someone who ignores the choice is never trapped in a menu.
+# Languages not listed here fall back to English so the intro is always well-formed.
+_LANG_INTRO: dict[str, dict[str, str]] = {
+    "en": {
+        "greeting": "Hi, thank you for calling {org}. I can help you book an appointment or answer questions about our services.",
+        "choose_prompt": "I can help you in {langs}. Which language would you prefer? You can also just go ahead and ask your question.",
+    },
+    "nl": {
+        "greeting": "Hallo, bedankt voor uw telefoontje naar {org}. Ik kan u helpen een afspraak te maken of vragen over onze diensten te beantwoorden.",
+        "choose_prompt": "Ik kan u helpen in {langs}. Welke taal heeft uw voorkeur? U kunt ook gewoon meteen uw vraag stellen.",
+    },
+    "fr": {
+        "greeting": "Bonjour, merci d'avoir appelé {org}. Je peux vous aider à prendre rendez-vous ou répondre à vos questions sur nos services.",
+        "choose_prompt": "Je peux vous aider en {langs}. Quelle langue préférez-vous ? Vous pouvez aussi poser directement votre question.",
+    },
+    "de": {
+        "greeting": "Hallo, danke für Ihren Anruf bei {org}. Ich kann Ihnen helfen, einen Termin zu buchen oder Fragen zu unseren Leistungen zu beantworten.",
+        "choose_prompt": "Ich kann Ihnen auf {langs} helfen. Welche Sprache möchten Sie? Sie können auch einfach Ihre Frage stellen.",
+    },
+    "es": {
+        "greeting": "Hola, gracias por llamar a {org}. Puedo ayudarle a reservar una cita o responder preguntas sobre nuestros servicios.",
+        "choose_prompt": "Puedo ayudarle en {langs}. ¿Qué idioma prefiere? También puede hacer su pregunta directamente.",
+    },
+}
+
+# How many of the org's supported languages to actually SPEAK in the opening.
+# Reading 15 languages aloud would be absurd, so the intro is capped — but the
+# LLM still MIRRORS every supported language in conversation (see
+# _mirror_language_instruction), so a capped intro never limits what the caller
+# can speak. Two covers the common bilingual clinic; raise if needed.
+_INTRO_MAX_SPOKEN_LANGS = 2
+
+
+def _draft_multilingual_begin_message(org: "Organization | None", supported_languages: list[str]) -> str:
+    """Opening utterance for a multi-language org: the AI-disclosure + a short
+    greeting spoken in each of the first `_INTRO_MAX_SPOKEN_LANGS` supported
+    languages, then a prompt (also per spoken language) asking which language the
+    caller would like — listing EVERY supported language by its English name
+    ("Dutch, English, French"). The prompt also invites the caller to just ask
+    their question, so no one is forced through the choice.
+
+    The disclosure (AI Act Art. 50) leads every language segment and is NOT
+    overridable — same legal guarantee as the single-language path."""
+    org_name = (org.name if org and org.name else None) or "our office"
+    spoken = supported_languages[:_INTRO_MAX_SPOKEN_LANGS] or ["en"]
+    langs = ", ".join(_LANG_ENGLISH_NAME.get(code, code) for code in supported_languages) or "English"
+
+    segments: list[str] = []
+    for code in spoken:
+        disclosure = _lang_disclosure(code)
+        intro = _LANG_INTRO.get(code, _LANG_INTRO["en"])
+        segments.append(f"{disclosure} {intro['greeting'].format(org=org_name)}")
+
+    prompts = [_LANG_INTRO.get(code, _LANG_INTRO["en"])["choose_prompt"].format(langs=langs) for code in spoken]
+    return " ".join(segments) + " " + " ".join(prompts)
+
+
+def _mirror_language_instruction(supported_languages: list[str]) -> str:
+    """System-prompt clause telling the LLM to auto-detect and mirror the
+    caller's language. Replaces the old hard single-language lock: instead of
+    forcing one language, the assistant follows whatever the caller speaks,
+    among the org's supported set. Covers ALL supported languages, not just the
+    ones spoken in the (capped) intro."""
+    names = [_LANG_ENGLISH_NAME.get(code, code) for code in supported_languages] or ["English"]
+    lang_list = ", ".join(names)
+    default_name = names[0]
+    return (
+        "LANGUAGE HANDLING: This caller may speak any of these languages: "
+        f"{lang_list}. Detect the language of the caller's most recent message and "
+        "ALWAYS reply in that same language. If the caller switches language mid-call, "
+        "switch with them on the very next reply. If their language is genuinely "
+        f"unclear (for example a one-word answer or just a name), reply in {default_name}. "
+        "Never announce or comment on the language switch — simply respond naturally in "
+        "the caller's language."
+    )
+
+
 # Codes in the 4000-4999 range are reserved for application use per RFC 6455.
 WS_CLOSE_VOICE_NOT_CONFIGURED = 4404
 WS_CLOSE_AGENT_MISMATCH = 4403
@@ -583,6 +673,11 @@ class _CallState:
         self.language_phase: bool = False
         self.selected_language: str = "en"
         self.org_supported_languages: list[str] = ["en"]
+        # True only for the call-OPEN language choice (the intro asks "which
+        # language?"). Distinguishes it from the on-demand switch menu: on the
+        # opening prompt, a caller who ignores the choice and just asks a
+        # question must be ANSWERED, not sent a "how can I help?" resume line.
+        self.initial_language_prompt: bool = False
         # Safety-net timer spawned when the language menu is presented.
         # Cancelled as soon as the caller makes any selection (valid or invalid).
         self.language_timeout_task: asyncio.Task | None = None
@@ -967,9 +1062,7 @@ async def _present_language_menu(sender: _Sender, state: _CallState, response_id
     prompt = _menu_prompt(state.selected_language)
     menu = _build_language_menu(state.org_supported_languages)
     state.language_phase = True
-    # Leading space: this closes an utterance already opened by the turn's filler
-    # frame (same response_id), and Retell concatenates content frames verbatim.
-    await sender.send_shortcut(response_id, f" {prompt} {menu}")
+    await sender.send_shortcut(response_id, f"{prompt} {menu}")
     # Arm the silence safety-net. Held on state so it isn't GC'd and can be
     # cancelled the moment a selection arrives.
     state.language_timeout_task = asyncio.create_task(
@@ -1012,60 +1105,75 @@ async def _handle_language_selection(
     transcript: list[dict],
     state: _CallState,
 ) -> None:
-    """Resolve the caller's choice on the on-demand language menu.
+    """Resolve the caller's language choice — for both the call-OPEN prompt (the
+    intro asks "which language?") and the on-demand switch menu.
 
-    On a clear choice: switch `selected_language` (all later turns get that
-    language's system-prompt instruction), clear language_phase, and speak a
-    short confirmation in the NEW language. The caller was already introduced +
-    AI-disclosed at call open, so we deliberately do NOT repeat the full greeting.
+    A short reply naming a language ("Dutch", "in English", "two") is treated as
+    the pick: switch `selected_language`, clear the phase, and speak a short
+    confirmation in the chosen language.
 
-    On an unclear response or silence: keep the current language and speak a
-    brief resume line rather than looping the menu. Log it so we can see how
-    often callers mis-hit the menu.
+    If the reply ISN'T a clean pick, behaviour depends on which prompt this is:
+      - Call-open prompt (`initial_language_prompt`): the caller skipped the
+        choice and just asked something — ANSWER it (route to a normal turn; the
+        LLM mirrors their language), so no one is trapped in a menu.
+      - On-demand menu, or silence: keep the current language and speak a brief
+        resume line rather than looping the menu.
     """
     if not state.language_phase:
         return  # Concurrent timeout task already resolved this.
 
+    initial = state.initial_language_prompt
     user_turns = [t for t in transcript if t.get("role") == "user"]
     user_input = (user_turns[-1].get("content") or "").strip() if user_turns else ""
 
     chosen = _detect_language_choice(user_input, state.org_supported_languages)
+    # A short reply IS the pick; a longer utterance that merely mentions a
+    # language ("do you have someone who speaks French about my crown?") is a
+    # real question, not a menu selection.
+    is_pick = chosen is not None and len(user_input.split()) <= 4
 
-    # Cancel the safety-net timer — the menu is resolved either way now.
+    # Cancel the safety-net timer + leave the language phase — resolved now.
     if state.language_timeout_task and not state.language_timeout_task.done():
         state.language_timeout_task.cancel()
     state.language_phase = False
+    state.initial_language_prompt = False
 
-    if chosen is None:
-        # Silence (empty transcript via reminder_required) or audible-but-
-        # unrecognised input: stay in the current language, don't loop the menu.
-        reason = "timeout" if not user_input else "invalid_input"
+    if is_pick:
+        state.selected_language = chosen
+        resume = _resume_line(chosen)
+        await sender.send_shortcut(response_id, resume)
         logger.info(
-            "language_menu_unresolved",
+            "language_switched",
             org_id=str(org_id),
+            channel="voice",
             call_id=call_id,
-            reason=reason,
-            language=state.selected_language,
+            language=chosen,
         )
-        await sender.send_shortcut(response_id, _resume_line(state.selected_language))
+        # Persist the confirmation as an AI message so the switch shows in history.
+        conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
+        async with async_session_maker() as db:
+            await add_message(db, conversation_id, MessageRole.ai, resume, Channel.voice)
         return
 
-    state.selected_language = chosen
-    resume = _resume_line(chosen)
-    await sender.send_shortcut(response_id, resume)
-    logger.info(
-        "language_switched",
-        org_id=str(org_id),
-        channel="voice",
-        call_id=call_id,
-        language=chosen,
-    )
+    if initial and user_input:
+        # Call-open prompt: caller ignored the choice and asked a real question.
+        # Don't drop it — note any detected language, then answer normally.
+        if chosen is not None:
+            state.selected_language = chosen
+        logger.info("language_prompt_skipped_answering", org_id=str(org_id), call_id=call_id)
+        await _handle_turn(sender, org_id, call_id, response_id, transcript, state)
+        return
 
-    # Persist the confirmation as an AI message so the switch shows in history.
-    # The menu text and the caller's one-word choice are UI plumbing, not saved.
-    conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
-    async with async_session_maker() as db:
-        await add_message(db, conversation_id, MessageRole.ai, resume, Channel.voice)
+    # On-demand menu miss, or silence: keep the current language, brief resume.
+    reason = "timeout" if not user_input else "invalid_input"
+    logger.info(
+        "language_menu_unresolved",
+        org_id=str(org_id),
+        call_id=call_id,
+        reason=reason,
+        language=state.selected_language,
+    )
+    await sender.send_shortcut(response_id, _resume_line(state.selected_language))
 
 
 async def _run_language_selection(
@@ -1181,8 +1289,8 @@ async def _handle_turn(
     # us), so they cost nothing extra on the critical path — no DB, no LLM.
 
     # Path A: Caller explicitly asked to hang up ("end the call", "hang up"…).
-    # Skip the filler and LLM entirely — reply immediately with a brief
-    # goodbye and signal Retell to disconnect.
+    # Skip the LLM entirely — reply immediately with a brief goodbye and signal
+    # Retell to disconnect.
     if _is_explicit_hangup(message_text):
         goodbye = "Of course. Goodbye, and have a great day!"
         await sender.send_end_call_shortcut(response_id, goodbye)
@@ -1215,21 +1323,6 @@ async def _handle_turn(
             await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
             await add_message(db, conversation_id, MessageRole.ai, "Goodbye!", Channel.voice)
         return
-
-    # Instant filler frame — nothing above this touches DB or LLM, so this
-    # goes on the wire ~1-3ms into the turn. Sent with content_complete=False
-    # under the real response_id so Retell keeps the utterance open and just
-    # appends the streamed answer to it. `collected` will start with this so
-    # the final persisted message text matches what was actually spoken.
-    filler = random.choice(_FILLERS)
-    await sender.send_chunk(response_id, filler, content_complete=False)
-    logger.info(
-        "voice_filler_sent_ms",
-        org_id=str(org_id),
-        call_id=call_id,
-        latency_ms=round((time.monotonic() - start) * 1000),
-        filler=filler.strip(),
-    )
 
     conversation_id = await _ensure_conversation(state, org_id, call_id, state.from_number or "unknown")
 
@@ -1264,10 +1357,9 @@ async def _handle_turn(
             await create_escalation(db, org_id, conversation_id, reason=message_text)
             await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
             await add_message(
-                db, conversation_id, MessageRole.ai, f"{filler} {VOICE_ESCALATION_REPLY}", Channel.voice
+                db, conversation_id, MessageRole.ai, VOICE_ESCALATION_REPLY, Channel.voice
             )
-        await sender.send_chunk(response_id, " " + VOICE_ESCALATION_REPLY, content_complete=False)
-        await sender.send_chunk(response_id, "", content_complete=True)
+        await sender.send_shortcut(response_id, VOICE_ESCALATION_REPLY)
         logger.info("voice_escalation_created", org_id=str(org_id), call_id=call_id)
         return
 
@@ -1288,9 +1380,9 @@ async def _handle_turn(
     # Structured appointment booking runs through the same FSM as chat/WhatsApp.
     # Once a booking is mid-flow we stay in it (sticky); otherwise a lightweight
     # keyword trigger starts one. Either way we skip RAG/LLM generation and speak
-    # the FSM's next prompt, appended to the filler utterance already open. The
-    # FSM's own extraction handles free-text service/date/time; on voice the
-    # collected email is used for the appointment reminder emails.
+    # the FSM's next prompt as a single complete utterance. The FSM's own
+    # extraction handles free-text service/date/time; on voice the collected
+    # email is used for the appointment reminder emails.
     booking_active = await booking_session_active(conversation_id)
     if booking_active or _is_booking_trigger(message_text):
         async with async_session_maker() as db:
@@ -1303,9 +1395,8 @@ async def _handle_turn(
                 if contact_id is not None
                 else FALLBACK_MESSAGE
             )
-        await sender.send_chunk(response_id, " " + reply, content_complete=False)
-        await sender.send_chunk(response_id, "", content_complete=True)
-        full_text = f"{filler} {reply}"
+        await sender.send_shortcut(response_id, reply)
+        full_text = reply
         async with async_session_maker() as db:
             await add_message(db, conversation_id, MessageRole.customer, message_text, Channel.voice)
             await add_message(db, conversation_id, MessageRole.ai, full_text, Channel.voice)
@@ -1412,15 +1503,16 @@ async def _handle_turn(
         },
         voice_mode=True,
     )
-    # For multi-language orgs, append the language-enforcement instruction LAST
-    # so it overrides the rest of the prompt.  Single-language orgs skip this —
-    # no need to add overhead to the prompt when there's only one language.
+    # For multi-language orgs, append the language-MIRRORING instruction LAST so
+    # it overrides the rest of the prompt. The assistant follows whatever
+    # language the caller actually speaks (among the org's supported set) rather
+    # than being locked to one — so a Dutch caller is answered in Dutch, an
+    # English caller in English, with no menu. Single-language orgs skip this
+    # (there's only one language to speak, so no instruction is needed).
     if len(state.org_supported_languages) > 1:
-        system_prompt = f"{system_prompt}\n\n{_lang_instruction(state.selected_language)}"
+        system_prompt = f"{system_prompt}\n\n{_mirror_language_instruction(state.org_supported_languages)}"
 
-    # Seed with the filler frame we already sent, so the persisted transcript
-    # matches what the caller actually heard.
-    collected: list[str] = [filler]
+    collected: list[str] = []
     first_token_at: float | None = None
     first_frame_sent_at: float | None = None
     try:
@@ -1574,16 +1666,24 @@ async def voice_llm_websocket(websocket: WebSocket, org_id: uuid.UUID, call_id: 
 
     # 2. Opening utterance — what the agent says first (response_id 0).
     #
-    #    Intro-first flow: EVERY caller now hears the AI-disclosure + greeting
-    #    immediately, in the org's default (first configured) language. We never
-    #    open with the IVR language menu — for multi-language orgs we instead
-    #    append a one-line invitation to switch language, and the menu is shown
-    #    on demand only when the caller actually asks (see _handle_turn's
-    #    language fast-path). This keeps the common case — a caller who speaks
-    #    the default language — free of an up-front menu they'd sit through.
-    opening = _draft_begin_message(config, org, language=supported_languages[0])
+    #    Intro-first flow: EVERY caller hears the AI-disclosure + greeting
+    #    immediately. Single-language orgs get the greeting in that one language.
+    #    Multi-language orgs get a MULTILINGUAL intro — disclosure + greeting
+    #    spoken in each supported language (capped) — ending with a spoken prompt
+    #    asking which language the caller would like (listing them by name), which
+    #    also invites them to just ask their question. The caller's next turn is
+    #    parsed as a language choice (see _handle_language_selection); a caller
+    #    who ignores it and asks something is answered, and from there the LLM
+    #    mirrors their language (see _mirror_language_instruction).
     if len(supported_languages) > 1:
-        opening = f"{opening} {_switch_invite(supported_languages[0])}"
+        opening = _draft_multilingual_begin_message(org, supported_languages)
+        # The caller's first turn answers "which language?" — route it through the
+        # selection handler. initial_language_prompt=True so a caller who skips the
+        # choice and just asks a question gets ANSWERED, not sent a resume line.
+        state.language_phase = True
+        state.initial_language_prompt = True
+    else:
+        opening = _draft_begin_message(config, org, language=supported_languages[0])
     greeting = opening
 
     await sender.send(

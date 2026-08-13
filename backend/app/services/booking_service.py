@@ -438,6 +438,49 @@ async def process_booking_intent(
                     contact.email = valid_email
                 await db.commit()
 
+    elif previous_state == BookingState.CONFIRMING:
+        # During confirmation, callers frequently CORRECT an ASR mis-hear of
+        # their name/email ("no, my name is USAMA") instead of giving a clean
+        # yes/no — especially on voice, where the read-back exists precisely so
+        # they can catch a mis-hear. A plain yes (with no correction words) is
+        # left to the FSM to book; anything else, we try to extract a name/email
+        # correction and, if one is found, apply it and RE-READ-BACK rather than
+        # looping "Sorry, should I go ahead and book that? (yes/no)".
+        text = user_input or ""
+        pure_yes = bool(_AFFIRMATIVE_RE.search(text)) and not bool(_NEGATIVE_RE.search(text))
+        if not pure_yes:
+            extracted = await _extract_contact_info(db, org_id, user_input)
+            name = (extracted.get("name") or "").strip() or None
+            email = (extracted.get("email") or "").strip() or None
+            valid_email = email if _is_valid_email(email) else None
+
+            changed = False
+            if name and name != fsm.collected_data.get("customer_name"):
+                fsm.collected_data["customer_name"] = name
+                changed = True
+            if valid_email and valid_email != fsm.collected_data.get("customer_email"):
+                fsm.collected_data["customer_email"] = valid_email
+                changed = True
+
+            if changed:
+                contact = await db.get(Contact, contact_id)
+                if contact is not None:
+                    if name:
+                        contact.name = name
+                    if valid_email:
+                        contact.email = valid_email
+                    await db.commit()
+                await fsm.save()  # stay in CONFIRMING with the corrected details
+                logger.info(
+                    "booking_confirm_correction",
+                    conversation_id=str(conversation_id),
+                    updated_name=bool(name),
+                    updated_email=bool(valid_email),
+                )
+                if channel == "voice":
+                    return _build_voice_confirmation(fsm.collected_data, org_tz)
+                return fsm._confirmation_result().response_text
+
     result = fsm.transition(intent, user_input)
     new_state = BookingState(result["new_state"])
 
@@ -463,7 +506,11 @@ async def process_booking_intent(
 
     if new_state == BookingState.COLLECTING_SERVICE and service_by_name:
         response_text += " We offer: " + ", ".join(service_by_name.keys()) + "."
-    elif new_state == BookingState.COLLECTING_TIME:
+    elif new_state == BookingState.COLLECTING_TIME and previous_state != BookingState.COLLECTING_TIME:
+        # Only offer the open-times list the FIRST time we enter this step.
+        # Re-dumping all six slots on every turn the caller stays in
+        # COLLECTING_TIME (e.g. an unparsed reply, or while spelling a name) is
+        # the "consultation slots repeated over and over" bug.
         service = service_by_name.get(fsm.collected_data.get("service", ""), {})
         duration = service.get("duration_minutes", DEFAULT_SERVICE_DURATION_MINUTES)
         slots = await _next_available_slots(db, org_id, duration, org_tz)

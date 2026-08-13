@@ -35,6 +35,16 @@ _REQUEST_TIMEOUT_SECONDS = 15.0
 # change it later in Retell's dashboard if they want a different one.
 DEFAULT_VOICE_ID = "retell-Cimo"
 
+# NOTE: the agent's transcriber `language` and `voice_id` are deliberately NOT
+# set here. They're owned per-agent in the Retell dashboard, because a voice
+# only supports a subset of languages (unsupported combos are greyed out), and
+# the right multilingual setup (Multiselect + an accuracy transcriber like
+# Soniox + a voice that supports the org's languages) is a Retell-side quality
+# choice per org. Forcing a value here (e.g. legacy "multi") would silently
+# overwrite that dashboard config on every re-provision. This provisioner only
+# owns the wiring to OUR backend: the Custom LLM URL, webhook, and boosted
+# keywords.
+
 
 class RetellProvisioningError(Exception):
     """Raised when provisioning an agent against Retell's API fails (missing

@@ -297,14 +297,11 @@ class TestCallStateLanguageDefaults:
         state = _CallState()
         assert state.org_supported_languages == ["en"]
 
-    def test_language_phase_is_not_set_at_open_regardless_of_language_count(self):
-        """Intro-first flow: the menu is on-demand, so a multi-language org does
-        NOT enter language_phase at call open — the caller can just start talking."""
+    def test_initial_language_prompt_defaults_false(self):
+        """The call-open language choice flag is off by default; the open path
+        sets it True for multi-language orgs (see voice_llm_websocket)."""
         state = _CallState()
-        state.org_supported_languages = ["en", "nl", "fr"]
-        # Nothing in the open path flips this now; it's only set by
-        # _present_language_menu when the caller asks to switch.
-        assert state.language_phase is False
+        assert state.initial_language_prompt is False
 
     def test_language_timeout_task_defaults_to_none(self):
         state = _CallState()
@@ -575,3 +572,44 @@ class TestHandleLanguageSelection:
 
         timeout_task.cancel.assert_called_once()
         assert state.selected_language == "en"  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_initial_prompt_answers_a_real_question_instead_of_looping(self):
+        """Call-open prompt: caller ignores the language choice and just asks a
+        question — it must be ANSWERED (routed to a turn), not sent a resume line."""
+        sender = self._make_sender()
+        state = self._make_state(["en", "nl", "fr"], current="en")
+        state.initial_language_prompt = True
+        transcript = [{"role": "user", "content": "what are your opening hours on saturday"}]
+
+        with patch(
+            "app.channels.voice.retell_handler._handle_turn", new_callable=AsyncMock
+        ) as handle_turn:
+            await _handle_language_selection(
+                sender, __import__("uuid").uuid4(), "call-8", 1, transcript, state
+            )
+
+        handle_turn.assert_awaited_once()          # the question was answered
+        sender.send_shortcut.assert_not_awaited()  # NOT a resume/menu line
+        assert state.language_phase is False
+        assert state.initial_language_prompt is False
+
+    @pytest.mark.asyncio
+    async def test_initial_prompt_short_pick_still_switches(self):
+        """A short language name on the opening prompt is still treated as a pick."""
+        sender = self._make_sender()
+        state = self._make_state(["en", "nl", "fr"], current="en")
+        state.initial_language_prompt = True
+        transcript = [{"role": "user", "content": "Nederlands"}]
+
+        with patch("app.channels.voice.retell_handler.async_session_maker"), \
+             patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
+             patch("app.channels.voice.retell_handler.add_message", new_callable=AsyncMock), \
+             patch("app.channels.voice.retell_handler._handle_turn", new_callable=AsyncMock) as handle_turn:
+            await _handle_language_selection(
+                sender, __import__("uuid").uuid4(), "call-9", 1, transcript, state
+            )
+
+        assert state.selected_language == "nl"
+        handle_turn.assert_not_awaited()           # a pick, not a turn
+        sender.send_shortcut.assert_awaited_once()

@@ -18,7 +18,11 @@ class BookingState(str, Enum):
     CANCELLED = "cancelled"
 
 
-_AFFIRMATIVE_RE = re.compile(r"\b(yes|yeah|yep|sure|confirm|sounds good|correct|book it|that works)\b", re.IGNORECASE)
+_AFFIRMATIVE_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|alright|correct|confirm|great|perfect|"
+    r"sounds good|looks good|book it|go ahead|please do|do it|that works|that'?s right)\b",
+    re.IGNORECASE,
+)
 _NEGATIVE_RE = re.compile(r"\b(no|nope|not that|different|change)\b", re.IGNORECASE)
 
 
