@@ -538,6 +538,21 @@ def _mirror_language_instruction(supported_languages: list[str]) -> str:
     )
 
 
+def _lock_language_instruction(language: str) -> str:
+    """System-prompt clause used AFTER the caller has explicitly picked a
+    language: force every reply into that language for the rest of the call, even
+    if the caller later uses a different one. Written as a strong English
+    directive (more reliable for the fast voice model than a target-language
+    instruction)."""
+    name = _LANG_ENGLISH_NAME.get(language, language)
+    return (
+        f"LANGUAGE LOCK: The caller has chosen to continue in {name}. You MUST "
+        f"respond ONLY in {name} for the entire rest of this call, even if the "
+        f"caller uses or switches to another language. Never reply in any language "
+        f"other than {name}."
+    )
+
+
 # Codes in the 4000-4999 range are reserved for application use per RFC 6455.
 WS_CLOSE_VOICE_NOT_CONFIGURED = 4404
 WS_CLOSE_AGENT_MISMATCH = 4403
@@ -665,6 +680,12 @@ class _CallState:
         self.language_phase: bool = False
         self.selected_language: str = "en"
         self.org_supported_languages: list[str] = ["en"]
+        # Set True once the caller EXPLICITLY picks a language (guided call-open
+        # choice or on-demand switch menu). While locked, every reply is forced
+        # into `selected_language` regardless of what the caller later speaks —
+        # the caller chose, so we honour it. A caller who never picks (just
+        # starts talking) stays unlocked and the LLM mirrors their language.
+        self.language_locked: bool = False
         # True only for the call-OPEN language choice (the intro asks "which
         # language?"). Distinguishes it from the on-demand switch menu: on the
         # opening prompt, a caller who ignores the choice and just asks a
@@ -1132,6 +1153,7 @@ async def _handle_language_selection(
 
     if is_pick:
         state.selected_language = chosen
+        state.language_locked = True  # explicit choice → stay in this language
         resume = _resume_line(chosen)
         await sender.send_shortcut(response_id, resume)
         logger.info(
@@ -1495,14 +1517,19 @@ async def _handle_turn(
         },
         voice_mode=True,
     )
-    # For multi-language orgs, append the language-MIRRORING instruction LAST so
-    # it overrides the rest of the prompt. The assistant follows whatever
-    # language the caller actually speaks (among the org's supported set) rather
-    # than being locked to one — so a Dutch caller is answered in Dutch, an
-    # English caller in English, with no menu. Single-language orgs skip this
-    # (there's only one language to speak, so no instruction is needed).
+    # Multi-language orgs get a language directive appended LAST so it overrides
+    # the rest of the prompt. Two modes:
+    #   - LOCKED (caller explicitly picked a language): force every reply into
+    #     that language for the rest of the call, honouring their choice.
+    #   - UNLOCKED (caller never picked, just started talking): mirror whatever
+    #     language each message is in.
+    # Single-language orgs skip this — there's only one language to speak.
     if len(state.org_supported_languages) > 1:
-        system_prompt = f"{system_prompt}\n\n{_mirror_language_instruction(state.org_supported_languages)}"
+        if state.language_locked:
+            directive = _lock_language_instruction(state.selected_language)
+        else:
+            directive = _mirror_language_instruction(state.org_supported_languages)
+        system_prompt = f"{system_prompt}\n\n{directive}"
 
     collected: list[str] = []
     first_token_at: float | None = None

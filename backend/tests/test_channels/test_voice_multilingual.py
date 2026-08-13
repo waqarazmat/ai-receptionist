@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from app.channels.voice.retell_handler import (
     _draft_multilingual_begin_message,
     _lang_disclosure,
+    _lock_language_instruction,
     _mirror_language_instruction,
 )
 
@@ -71,6 +72,23 @@ class TestMultilingualOpening:
     def test_none_org_uses_neutral_name(self):
         msg = _draft_multilingual_begin_message(None, ["nl", "en"])
         assert "our office" in msg
+
+
+class TestLockLanguageInstruction:
+    def test_names_the_locked_language_and_forces_it(self):
+        instr = _lock_language_instruction("nl")
+        assert "Dutch" in instr
+        assert "ONLY in Dutch" in instr
+
+    def test_locks_even_when_caller_switches(self):
+        instr = _lock_language_instruction("fr")
+        low = instr.lower()
+        assert "french" in low
+        assert "even if" in low   # stays locked even if the caller switches
+
+    def test_unknown_code_falls_back_to_code(self):
+        # Never crashes on an unmapped code.
+        assert "xx" in _lock_language_instruction("xx")
 
 
 class TestMirrorLanguageInstruction:

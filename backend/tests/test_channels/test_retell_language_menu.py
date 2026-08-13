@@ -593,13 +593,16 @@ class TestHandleLanguageSelection:
         sender.send_shortcut.assert_not_awaited()  # NOT a resume/menu line
         assert state.language_phase is False
         assert state.initial_language_prompt is False
+        assert state.language_locked is False      # they didn't pick → mirror, not locked
 
     @pytest.mark.asyncio
-    async def test_initial_prompt_short_pick_still_switches(self):
-        """A short language name on the opening prompt is still treated as a pick."""
+    async def test_initial_prompt_short_pick_switches_and_locks(self):
+        """A short language name on the opening prompt is a pick — switch AND lock
+        so the rest of the call stays in that language."""
         sender = self._make_sender()
         state = self._make_state(["en", "nl", "fr"], current="en")
         state.initial_language_prompt = True
+        assert state.language_locked is False
         transcript = [{"role": "user", "content": "Nederlands"}]
 
         with patch("app.channels.voice.retell_handler.async_session_maker"), \
@@ -611,5 +614,6 @@ class TestHandleLanguageSelection:
             )
 
         assert state.selected_language == "nl"
+        assert state.language_locked is True       # explicit pick → locked
         handle_turn.assert_not_awaited()           # a pick, not a turn
         sender.send_shortcut.assert_awaited_once()

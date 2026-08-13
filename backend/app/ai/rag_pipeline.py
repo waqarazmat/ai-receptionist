@@ -95,19 +95,35 @@ async def hybrid_search(
     if not fused_scores:
         return []
 
-    ranked = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)[:top_k]
+    # Walk the FULL ranked list (not a top_k slice) and skip chunks whose content
+    # duplicates one we've already taken, so N identical copies of a chunk can't
+    # fill all top_k slots and crowd out other relevant chunks. A crawled KB often
+    # holds the same passage many times; without this, e.g. three copies of a
+    # whitening blurb pushed the opening-hours chunk out of the results entirely.
+    # Dedup is by normalized content only (whitespace/case), so it removes exact
+    # repeats — which carry no extra information — never distinct passages.
+    ranked = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)
 
-    results = [
-        ChunkResult(
-            chunk_id=chunk_id,
-            # A chunk that only matched via full-text (not in the semantic
-            # candidate pool) has no similarity computed — default to 0.0,
-            # which correctly biases toward escalating rather than guessing.
-            content=content_by_id[chunk_id],
-            score=max(similarity_by_id.get(chunk_id, 0.0), 0.0),
+    results: list[ChunkResult] = []
+    seen_content: set[str] = set()
+    for chunk_id, _rrf_score in ranked:
+        content = content_by_id[chunk_id]
+        content_key = " ".join(content.split()).lower()
+        if content_key in seen_content:
+            continue
+        seen_content.add(content_key)
+        results.append(
+            ChunkResult(
+                chunk_id=chunk_id,
+                # A chunk that only matched via full-text (not in the semantic
+                # candidate pool) has no similarity computed — default to 0.0,
+                # which correctly biases toward escalating rather than guessing.
+                content=content,
+                score=max(similarity_by_id.get(chunk_id, 0.0), 0.0),
+            )
         )
-        for chunk_id, _rrf_score in ranked
-    ]
+        if len(results) == top_k:
+            break
 
     # "Best score" = highest actual similarity in the set, not just results[0]
     # — RRF order and similarity order can disagree (e.g. an FTS-only match
