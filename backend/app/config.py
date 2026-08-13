@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # slow Calendar API can't stall bookings — on timeout it degrades exactly like
     # a Calendar error (falls back to the DB appointment guard).
     CALENDAR_FREEBUSY_TIMEOUT_SECONDS: float = 5.0
+    # Bounds the Google Calendar event-creation call in _finalize_booking so a
+    # slow/hanging Calendar API (or auth-token fetch) can NEVER freeze a booking
+    # mid-confirmation — on timeout the booking still completes, just without a
+    # calendar event (staff add it manually), exactly like a Calendar error.
+    CALENDAR_EVENT_TIMEOUT_SECONDS: float = 10.0
     # Back the Socket.IO servers with a Redis manager so emits work across multiple
     # web workers/replicas. MUST be enabled before running WEB_CONCURRENCY > 1 (or
     # multiple replicas) or cross-worker delivery breaks. Off = single-worker (current).

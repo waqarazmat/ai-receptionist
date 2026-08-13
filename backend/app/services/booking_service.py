@@ -1,3 +1,4 @@
+import asyncio
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from app.ai.llm_router import (
     parse_json_response,
 )
 from app.ai.prompts.booking_prompts import get_booking_extraction_prompt, get_contact_info_extraction_prompt
+from app.config import settings
 from app.booking import slot_manager
 from app.booking.fsm import BookingFSM, BookingState
 from app.booking.google_calendar import GoogleCalendarClient, GoogleCalendarError
@@ -600,17 +602,25 @@ async def _finalize_booking(
         google_event_id = None
         try:
             client = await GoogleCalendarClient.for_org(db, org_id)
-            google_event_id = await client.create_event(
-                summary=f"{service_name} — {contact.name if contact else 'Customer'}",
-                start=start,
-                end=end,
-                attendee_email=contact.email if contact else None,
-                time_zone=org_timezone_name,
+            # Bound the whole create call (auth-token fetch + insert) so a slow or
+            # hanging Calendar API can never freeze the booking mid-confirmation —
+            # which otherwise left the customer staring at a "typing…" indicator
+            # forever after they said yes.
+            google_event_id = await asyncio.wait_for(
+                client.create_event(
+                    summary=f"{service_name} — {contact.name if contact else 'Customer'}",
+                    start=start,
+                    end=end,
+                    attendee_email=contact.email if contact else None,
+                    time_zone=org_timezone_name,
+                ),
+                timeout=settings.CALENDAR_EVENT_TIMEOUT_SECONDS,
             )
-        except GoogleCalendarError as exc:
+        except (GoogleCalendarError, asyncio.TimeoutError) as exc:
             # Booking still proceeds without a calendar event — staff see it
             # in the appointments list and can add it to the calendar
-            # manually; that's better than losing the booking outright.
+            # manually; that's better than losing the booking outright (or
+            # hanging the conversation waiting on Google).
             logger.warning("calendar_event_create_failed", org_id=str(org_id), error=str(exc))
 
         # Postgres stores timestamptz internally as UTC regardless of the
