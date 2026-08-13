@@ -494,36 +494,28 @@ _LANG_INTRO: dict[str, dict[str, str]] = {
     },
 }
 
-# How many of the org's supported languages to actually SPEAK in the opening.
-# Reading 15 languages aloud would be absurd, so the intro is capped — but the
-# LLM still MIRRORS every supported language in conversation (see
-# _mirror_language_instruction), so a capped intro never limits what the caller
-# can speak. Two covers the common bilingual clinic; raise if needed.
-_INTRO_MAX_SPOKEN_LANGS = 2
-
-
 def _draft_multilingual_begin_message(org: "Organization | None", supported_languages: list[str]) -> str:
-    """Opening utterance for a multi-language org: the AI-disclosure + a short
-    greeting spoken in each of the first `_INTRO_MAX_SPOKEN_LANGS` supported
-    languages, then a prompt (also per spoken language) asking which language the
-    caller would like — listing EVERY supported language by its English name
-    ("Dutch, English, French"). The prompt also invites the caller to just ask
-    their question, so no one is forced through the choice.
+    """Opening utterance for a multi-language org. The introduction (AI-Act
+    disclosure + greeting) is spoken ONCE, in English — or the org's first
+    language if it doesn't support English — and ends with a prompt asking which
+    language the caller would like, listing every supported language by its
+    English name ("Dutch, English, French") and inviting them to just ask their
+    question. The intro is deliberately NOT repeated in every language: doing so
+    made the opening long and repetitive.
 
-    The disclosure (AI Act Art. 50) leads every language segment and is NOT
-    overridable — same legal guarantee as the single-language path."""
+    The disclosure (AI Act Art. 50) still leads the utterance and is NOT
+    overridable."""
     org_name = (org.name if org and org.name else None) or "our office"
-    spoken = supported_languages[:_INTRO_MAX_SPOKEN_LANGS] or ["en"]
     langs = ", ".join(_LANG_ENGLISH_NAME.get(code, code) for code in supported_languages) or "English"
 
-    segments: list[str] = []
-    for code in spoken:
-        disclosure = _lang_disclosure(code)
-        intro = _LANG_INTRO.get(code, _LANG_INTRO["en"])
-        segments.append(f"{disclosure} {intro['greeting'].format(org=org_name)}")
-
-    prompts = [_LANG_INTRO.get(code, _LANG_INTRO["en"])["choose_prompt"].format(langs=langs) for code in spoken]
-    return " ".join(segments) + " " + " ".join(prompts)
+    # Speak the intro in English (the common lingua franca), falling back to the
+    # org's first language only if English isn't supported.
+    intro_lang = _language_fallback(supported_languages) if supported_languages else "en"
+    intro = _LANG_INTRO.get(intro_lang, _LANG_INTRO["en"])
+    disclosure = _lang_disclosure(intro_lang)
+    greeting = intro["greeting"].format(org=org_name)
+    prompt = intro["choose_prompt"].format(langs=langs)
+    return f"{disclosure} {greeting} {prompt}"
 
 
 def _mirror_language_instruction(supported_languages: list[str]) -> str:
