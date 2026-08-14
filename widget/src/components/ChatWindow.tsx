@@ -20,6 +20,7 @@ interface Props {
   onInputChange: (v: string) => void;
   onSend: () => void;
   onClose: () => void;
+  onReset: () => void;
   onSuggestion: (q: string) => void;
   onSlotSelect: (title: string) => void;
 }
@@ -41,7 +42,7 @@ const AI_DISCLOSURE: Record<string, string> = {
 export function ChatWindow({
   config, phase, lang, messages, isTyping,
   inputValue, isSending, consentAccepted,
-  onLangSelect, onPreChatSubmit, onAcceptConsent, onInputChange, onSend, onClose, onSuggestion,
+  onLangSelect, onPreChatSubmit, onAcceptConsent, onInputChange, onSend, onClose, onReset, onSuggestion,
   onSlotSelect,
 }: Props) {
   const posClass = config.position === "bottom-left" ? "pos-left" : "pos-right";
@@ -91,6 +92,21 @@ export function ChatWindow({
             <span>Online</span>
           </div>
         </div>
+        {phase === "chat" && (
+          <button
+            class="reset-btn"
+            onClick={onReset}
+            type="button"
+            aria-label="Start a new conversation"
+            title="Start a new conversation"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="17" height="17" viewBox="0 0 24 24"
+                 fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 2v6h6" />
+              <path d="M3 13a9 9 0 1 0 3-7.7L3 8" />
+            </svg>
+          </button>
+        )}
         <button class="close-btn" onClick={onClose} type="button" aria-label="Close">&#215;</button>
       </div>
 

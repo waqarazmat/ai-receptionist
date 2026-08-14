@@ -4,7 +4,7 @@ import type { Message } from "./components/MessageBubble.js";
 import type { ChatPhase } from "./components/ChatWindow.js";
 import { Launcher } from "./components/Launcher.js";
 import { ChatWindow } from "./components/ChatWindow.js";
-import { loadStoredConversationId, saveConversationId } from "./session.js";
+import { loadStoredConversationId, saveConversationId, clearStoredSession } from "./session.js";
 import { ChatWebSocket } from "./ws.js";
 import type { WsEvent } from "./ws.js";
 import { sendMessage, loadHistory, identifyVisitor, updateLocale } from "./api.js";
@@ -210,6 +210,30 @@ export function App({ orgId, apiBase, initialConfig }: AppProps) {
     setInputValue(q);
   }
 
+  // ── Reset ────────────────────────────────────────────────────────────────────
+  // Start a brand-new conversation: forget the stored conversation id (so a reload
+  // no longer resumes the old chat), drop the on-screen history, and go back to the
+  // language/welcome screen. A fresh WebSocket with no conversation id means the
+  // backend creates a new conversation on the next message.
+  function handleReset() {
+    clearStoredSession(orgId);
+    wsRef.current?.close();
+    if (typingTimer.current) { clearTimeout(typingTimer.current); typingTimer.current = null; }
+    streamingMsgId.current = null;
+    setMessages([]);
+    setIsTyping(false);
+    setIsSending(false);
+    setInputValue("");
+    setPhase("welcome");
+    wsRef.current = new ChatWebSocket(
+      apiBase,
+      orgId,
+      null,
+      handleWsEvent,
+      (conversationId) => saveConversationId(orgId, conversationId),
+    );
+  }
+
   return (
     <>
       {isOpen && (
@@ -228,6 +252,7 @@ export function App({ orgId, apiBase, initialConfig }: AppProps) {
           onInputChange={setInputValue}
           onSend={handleSend}
           onClose={() => setIsOpen(false)}
+          onReset={handleReset}
           onSuggestion={handleSuggestion}
           onSlotSelect={handleSend}
         />

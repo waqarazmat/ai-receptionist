@@ -149,6 +149,17 @@ export const STYLES = /* css */ `
   font-size: 18px; flex-shrink: 0; line-height: 1;
 }
 .close-btn:hover { background: rgba(255,255,255,0.28); transform: rotate(90deg) scale(1.05); }
+.reset-btn {
+  position: relative;
+  background: rgba(255,255,255,0.16);
+  border: 1.5px solid rgba(255,255,255,0.25);
+  color: white; cursor: pointer; border-radius: 50%;
+  width: 30px; height: 30px; margin-right: 8px;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.2s ease, transform 0.2s ease;
+  flex-shrink: 0; line-height: 1;
+}
+.reset-btn:hover { background: rgba(255,255,255,0.28); transform: rotate(-30deg) scale(1.05); }
 
 /* ══════════════════════════════════════
    WELCOME SCREEN
