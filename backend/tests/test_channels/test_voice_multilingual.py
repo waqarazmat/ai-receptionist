@@ -13,7 +13,10 @@ Behaviour under test:
 
 from types import SimpleNamespace
 
+import pytest
+
 from app.channels.voice.retell_handler import (
+    _detect_named_language,
     _draft_multilingual_begin_message,
     _lang_disclosure,
     _lock_language_instruction,
@@ -72,6 +75,36 @@ class TestMultilingualOpening:
     def test_none_org_uses_neutral_name(self):
         msg = _draft_multilingual_begin_message(None, ["nl", "en"])
         assert "our office" in msg
+
+
+class TestDetectNamedLanguage:
+    S = ["nl", "en", "fr"]
+
+    @pytest.mark.parametrize("text,expected", [
+        ("yeah I want to continue in English", "en"),
+        ("I want to talk in English", "en"),
+        ("continue in Dutch please", "nl"),
+        ("let's use French", "fr"),
+        ("can we proceed in Nederlands", "nl"),
+        ("could you switch to French for me", "fr"),
+        ("English", "en"),
+        ("Nederlands", "nl"),
+    ])
+    def test_natural_phrasing_naming_a_language_is_detected(self, text, expected):
+        assert _detect_named_language(text, self.S) == expected
+
+    @pytest.mark.parametrize("text", [
+        "I have one question about pricing",   # "one" must NOT read as English
+        "what are your opening hours",
+        "can I book two appointments",         # "two" must NOT read as Dutch
+        "hello there",
+    ])
+    def test_no_language_name_returns_none(self, text):
+        assert _detect_named_language(text, self.S) is None
+
+    def test_only_matches_supported_languages(self):
+        # German named but org supports only nl/en/fr → None.
+        assert _detect_named_language("let's do it in German", self.S) is None
 
 
 class TestLockLanguageInstruction:

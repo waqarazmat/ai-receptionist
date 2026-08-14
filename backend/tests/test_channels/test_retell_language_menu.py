@@ -617,3 +617,26 @@ class TestHandleLanguageSelection:
         assert state.language_locked is True       # explicit pick → locked
         handle_turn.assert_not_awaited()           # a pick, not a turn
         sender.send_shortcut.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_natural_phrasing_language_request_switches_and_locks(self):
+        """The reported bug: a full sentence naming a language ('yeah, I want to
+        continue in English') must be recognized as the choice — not routed off
+        as a question just because it's longer than a few words."""
+        sender = self._make_sender()
+        state = self._make_state(["nl", "en", "fr"], current="nl")
+        state.initial_language_prompt = True
+        transcript = [{"role": "user", "content": "yeah I want to continue in English"}]
+
+        with patch("app.channels.voice.retell_handler.async_session_maker"), \
+             patch("app.channels.voice.retell_handler._ensure_conversation", new_callable=AsyncMock), \
+             patch("app.channels.voice.retell_handler.add_message", new_callable=AsyncMock), \
+             patch("app.channels.voice.retell_handler._handle_turn", new_callable=AsyncMock) as handle_turn:
+            await _handle_language_selection(
+                sender, __import__("uuid").uuid4(), "call-nat", 1, transcript, state
+            )
+
+        assert state.selected_language == "en"
+        assert state.language_locked is True
+        handle_turn.assert_not_awaited()           # recognized as a pick, not answered as a question
+        sender.send_shortcut.assert_awaited_once()

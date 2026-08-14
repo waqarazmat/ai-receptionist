@@ -356,6 +356,40 @@ def _detect_language_choice(user_input: str, supported_languages: list[str]) -> 
     return None
 
 
+# Language NAMES only (endonyms + common exonyms across languages) — NO position
+# digits or number-words. A name appearing anywhere in a reply ("yeah, let's
+# continue in English") is an unambiguous choice at any sentence length, unlike a
+# bare "1"/"two", which is only meaningful in a short menu-style answer.
+_LANG_NAME_KEYWORDS: dict[str, set[str]] = {
+    "en": {"english", "engels", "anglais", "inglese", "inglés", "ingles"},
+    "nl": {"dutch", "nederlands", "hollands", "néerlandais", "neerlandais", "olandese", "holandés"},
+    "fr": {"french", "français", "francais", "frans", "französisch", "francese", "francés", "frances"},
+    "de": {"german", "deutsch", "duits", "allemand", "tedesco", "alemán", "aleman"},
+    "es": {"spanish", "español", "espanol", "spaans", "espagnol", "spagnolo"},
+    "it": {"italian", "italiano", "italiaans", "italien"},
+    "pt": {"portuguese", "português", "portugues", "portugees", "portugais"},
+    "ar": {"arabic", "arabisch", "arabe", "عربي"},
+    "tr": {"turkish", "türkçe", "turkce", "turks", "turc"},
+    "ur": {"urdu", "اردو"},
+    "hi": {"hindi", "हिंदी"},
+    "zh": {"chinese", "mandarin", "chinees", "chinois", "中文"},
+    "ru": {"russian", "russisch", "russe", "русский"},
+    "pl": {"polish", "polski", "pools", "polonais"},
+}
+
+
+def _detect_named_language(user_input: str, supported_languages: list[str]) -> str | None:
+    """Return the supported language the caller NAMED anywhere in their reply
+    ("I'd like to continue in Dutch" → nl), or None. Names only — never digits or
+    number-words — so it's safe to trust on a full sentence, not just a one-word
+    menu answer."""
+    normalized = user_input.strip().lower()
+    for code in supported_languages:
+        if any(kw in normalized for kw in _LANG_NAME_KEYWORDS.get(code, ())):
+            return code
+    return None
+
+
 def _lang_disclosure(language: str) -> str:
     """AI Act Art. 50 disclosure text in the given language."""
     return _LANG_INFO.get(language, _LANG_INFO["en"])["disclosure"]
@@ -1140,10 +1174,17 @@ async def _handle_language_selection(
     user_input = (user_turns[-1].get("content") or "").strip() if user_turns else ""
 
     chosen = _detect_language_choice(user_input, state.org_supported_languages)
-    # A short reply IS the pick; a longer utterance that merely mentions a
-    # language ("do you have someone who speaks French about my crown?") is a
-    # real question, not a menu selection.
-    is_pick = chosen is not None and len(user_input.split()) <= 4
+    named = _detect_named_language(user_input, state.org_supported_languages)
+    # If the caller NAMES a language anywhere ("yeah, I'd like to continue in
+    # English"), that's an unambiguous choice at any length. Otherwise fall back
+    # to _detect_language_choice's digit/number-word match, but only trust that
+    # for a short menu-style reply — so "I have one question" isn't read as
+    # picking English (position 1).
+    if named is not None:
+        chosen = named
+        is_pick = True
+    else:
+        is_pick = chosen is not None and len(user_input.split()) <= 4
 
     # Cancel the safety-net timer + leave the language phase — resolved now.
     if state.language_timeout_task and not state.language_timeout_task.done():
