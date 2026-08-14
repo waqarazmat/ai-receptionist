@@ -64,6 +64,22 @@ _REVIEW_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# At CONFIRMING, a message that supplies/corrects a name or email ("my name is
+# Waqar", "it's spelled W-A-Q-A-R", "the email is …"). Used so an affirmative
+# word buried in a correction ("the date is CORRECT, but my name is …") is NOT
+# mistaken for a full booking confirmation — that booked prematurely with the
+# wrong details and dropped the session.
+_CONTACT_CORRECTION_RE = re.compile(
+    r"\b(?:(?:my|the|your)\s+(?:name|e-?mail)|(?:name|e-?mail)\s+is|"
+    r"spell(?:ed|ing)?|(?:it'?s|that'?s)\s+spelled)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_contact_correction(text: str) -> bool:
+    return bool(_CONTACT_CORRECTION_RE.search(text or ""))
+
+
 # During the service/time-collection steps, a bare answer ("cleaning", "sun 1pm")
 # classifies as faq/off_topic, NOT a booking intent — so to keep the booking alive
 # we route any non-question reply back into the FSM and only let a genuine question
@@ -437,6 +453,22 @@ async def process_booking_intent(
         if extracted.get("time"):
             fsm.collected_data["time"] = extracted["time"]
 
+        # If the requested day is one the practice is CLOSED (e.g. a weekend),
+        # say so immediately and ask for another day — don't accept the day and
+        # then reject it after they also give a time. Drop the closed date.
+        req_date_str = fsm.collected_data.get("date")
+        if req_date_str:
+            req_dt = _parse_slot_datetime(req_date_str, fsm.collected_data.get("time") or "12:00", org_tz)
+            if req_dt is not None and not slot_manager.is_open_on(org, req_dt.date()):
+                fsm.collected_data.pop("date", None)
+                fsm.collected_data.pop("time", None)
+                await fsm.save()
+                day_name = req_dt.strftime("%A")
+                open_phrase = slot_manager.open_days_phrase(org)
+                if open_phrase:
+                    return f"Sorry, we're closed on {day_name}s — we're open {open_phrase}. Which day would suit you?"
+                return f"Sorry, we're closed on {day_name}s. Which other day would suit you?"
+
         # Single-service org: there's nothing to choose, so don't make the
         # customer name the only service (which just produces a "what service?
         # — we offer X" loop). Auto-select it and move straight on to the time.
@@ -457,10 +489,11 @@ async def process_booking_intent(
                 fsm.collected_data.pop("date", None)
                 fsm.collected_data.pop("time", None)
                 await fsm.save()
-                alternatives = await _next_available_slots(db, org_id, duration, org_tz)
+                # Show only a few nearest alternatives, not the whole list again.
+                alternatives = (await _next_available_slots(db, org_id, duration, org_tz))[:3]
                 if alternatives:
                     return (
-                        f"Sorry, that time isn't available. Some other options: "
+                        f"Sorry, that time isn't available. The nearest openings are "
                         f"{_format_slot_options(alternatives, channel)}. What works for you?"
                     )
                 return "Sorry, that time isn't available and I couldn't find another opening soon — could you try a different day?"
@@ -514,7 +547,14 @@ async def process_booking_intent(
                 return _build_voice_confirmation(fsm.collected_data, org_tz)
             return fsm._confirmation_result().response_text
 
-        pure_yes = bool(_AFFIRMATIVE_RE.search(text)) and not bool(_NEGATIVE_RE.search(text))
+        # A confirmation must be a CLEAN yes — not a negative, and not a message
+        # that's actually supplying/correcting the name or email (where an
+        # affirmative like "correct" refers to the date, not "book it").
+        pure_yes = (
+            bool(_AFFIRMATIVE_RE.search(text))
+            and not bool(_NEGATIVE_RE.search(text))
+            and not _looks_like_contact_correction(text)
+        )
         if not pure_yes:
             extracted = await _extract_contact_info(db, org_id, user_input)
             name = (extracted.get("name") or "").strip() or None

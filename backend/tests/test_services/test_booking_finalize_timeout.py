@@ -17,6 +17,29 @@ from app.booking.fsm import BookingFSM, BookingState
 from app.services import booking_service
 
 
+class TestContactCorrectionGuard:
+    """A message that supplies/corrects a name or email must NOT be read as a
+    booking confirmation, even if it contains an affirmative like "correct".
+    Regression: "the date is correct, my name is Waqar" booked prematurely with
+    the wrong details and dropped the booking session."""
+
+    @pytest.mark.parametrize("text", [
+        "The date is correct. My name is Waqar spelled W-A-Q-A-R",
+        "correct, but my name is Waqar",
+        "it's spelled W-A-Q-A-R",
+        "the email is waqar at gmail dot com",
+        "no my name is X",
+    ])
+    def test_corrections_are_detected(self, text):
+        assert booking_service._looks_like_contact_correction(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "yes", "that's correct", "yes book it", "go ahead", "perfect",
+    ])
+    def test_clean_confirmations_are_not_corrections(self, text):
+        assert booking_service._looks_like_contact_correction(text) is False
+
+
 class TestReviewRequestDetection:
     """At CONFIRMING, distinguish 'let me hear/verify the details' from a yes.
     Regression: 'I want to confirm my email' used to BOOK (matched 'confirm')."""

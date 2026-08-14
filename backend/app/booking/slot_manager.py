@@ -96,6 +96,33 @@ def _working_hours_for(org: Organization | None, day: date) -> tuple[time, time]
     return open_time, close_time
 
 
+_WEEKDAY_ORDER = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def is_open_on(org: "Organization | None", day: date) -> bool:
+    """Whether the org has working hours on `day` (False = closed that day)."""
+    return _working_hours_for(org, day) is not None
+
+
+def open_days_phrase(org: "Organization | None") -> str:
+    """A short natural phrase of the weekdays the org is open — "Monday to Friday"
+    for a contiguous run, else "Monday, Wednesday and Friday". "" if unknown."""
+    hours_map = (org.working_hours or {}).get("hours", {}) if org else {}
+    names = [
+        d.capitalize()
+        for d in _WEEKDAY_ORDER
+        if hours_map.get(d) and hours_map[d].get("open") and hours_map[d].get("close")
+    ]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    idx = [_WEEKDAY_ORDER.index(n.lower()) for n in names]
+    if idx == list(range(idx[0], idx[0] + len(idx))):  # contiguous weekdays
+        return f"{names[0]} to {names[-1]}"
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
 async def _busy_ranges(
     db: AsyncSession, org_id: uuid.UUID, window_start: datetime, window_end: datetime
 ) -> list[tuple[datetime, datetime]]:
