@@ -17,6 +17,35 @@ from app.booking.fsm import BookingFSM, BookingState
 from app.services import booking_service
 
 
+class TestReviewRequestDetection:
+    """At CONFIRMING, distinguish 'let me hear/verify the details' from a yes.
+    Regression: 'I want to confirm my email' used to BOOK (matched 'confirm')."""
+
+    @pytest.mark.parametrize("text", [
+        "you please read back the email",
+        "I want to confirm my email",
+        "can you read the email back",
+        "repeat that",
+        "spell my name",
+        "what's my email",
+        "check my email",
+    ])
+    def test_review_requests_are_detected(self, text):
+        assert booking_service._REVIEW_REQUEST_RE.search(text) is not None
+
+    @pytest.mark.parametrize("text", [
+        "yes",
+        "confirm it",
+        "please confirm",
+        "confirm the booking",
+        "confirm my booking",
+        "go ahead",
+        "no my name is malik aliyan",
+    ])
+    def test_booking_confirmations_are_not_review_requests(self, text):
+        assert booking_service._REVIEW_REQUEST_RE.search(text) is None
+
+
 def test_confirming_affirmative_regexes_are_imported_in_booking_service():
     """Regression: process_booking_intent's CONFIRMING branch references
     _AFFIRMATIVE_RE / _NEGATIVE_RE. They live in fsm.py and were NOT imported

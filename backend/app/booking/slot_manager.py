@@ -72,10 +72,19 @@ def _working_hours_for(org: Organization | None, day: date) -> tuple[time, time]
     if org is None:
         return DEFAULT_OPEN_TIME, DEFAULT_CLOSE_TIME
 
-    weekday_name = day.strftime("%A").lower()
-    hours = (org.working_hours or {}).get("hours", {}).get(weekday_name)
-    if not hours:
+    hours_map = (org.working_hours or {}).get("hours", {})
+    if not hours_map:
+        # Org hasn't configured ANY hours → sensible default so bookings still work.
         return DEFAULT_OPEN_TIME, DEFAULT_CLOSE_TIME
+
+    weekday_name = day.strftime("%A").lower()
+    hours = hours_map.get(weekday_name)
+    if not hours:
+        # Hours ARE configured, just not for this weekday → the business is CLOSED
+        # that day (a schedule listing Mon–Fri means Sat/Sun are shut). Previously
+        # a missing day fell through to the default open hours, which handed out
+        # slots on days the org is actually closed (e.g. Sundays).
+        return None
     if hours.get("open") is None or hours.get("close") is None:
         return None  # explicitly closed that day
 

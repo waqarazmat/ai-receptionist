@@ -103,6 +103,14 @@ def get_system_prompt(org_config: dict, voice_mode: bool = False) -> str:
             "a person would say them (e.g. \"nine AM\", not \"9:00 AM\")."
         )
         lines.append(
+            "- Do NOT end every reply with a generic offer of more help "
+            "(\"How can I help you further?\", \"Is there anything else I can help with?\", "
+            "\"laat het me gerust weten\", etc.). Repeated on every turn and spoken aloud it "
+            "sounds robotic. Just answer the question and stop. Only ask if there's anything "
+            "else ONCE — when a topic is clearly finished (after fully answering a question or "
+            "confirming a booking) — and vary the wording naturally."
+        )
+        lines.append(
             "- Call termination: when the caller explicitly asks to hang up or end the call "
             "(\"hang up\", \"end the call\", \"that's all\", \"goodbye\" etc.), give ONE brief "
             "polite farewell (e.g. \"Goodbye, have a great day!\") and then append the exact "

@@ -111,12 +111,19 @@ class BookingFSM:
         )
 
     def _handle_collecting_time(self, intent: str, user_input: str) -> TransitionResult:
-        if not self.collected_data.get("date") or not self.collected_data.get("time"):
-            return TransitionResult(
-                BookingState.COLLECTING_TIME,
-                "What day and time works best for you?",
-                True,
-            )
+        has_date = bool(self.collected_data.get("date"))
+        has_time = bool(self.collected_data.get("time"))
+        if not (has_date and has_time):
+            # Acknowledge whatever they DID give and ask for the missing half,
+            # instead of blankly repeating "what day and time?" (which stranded
+            # callers who gave only a day, e.g. "Friday", or only a time).
+            if has_date and not has_time:
+                prompt = "Great. And what time of day works best for you?"
+            elif has_time and not has_date:
+                prompt = "Sure. And which day would you like to come in?"
+            else:
+                prompt = "What day and time works best for you?"
+            return TransitionResult(BookingState.COLLECTING_TIME, prompt, True)
         # Already have name+email from a prior pass through this flow (e.g.
         # the customer picked a different time after CONFIRMING said no) —
         # no need to ask again.

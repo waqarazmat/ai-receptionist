@@ -13,11 +13,18 @@ or any other timezone.
 Respond with ONLY this JSON, no other text:
 {{"service": "<one of the available services, exactly as listed, or null>", "date": "<YYYY-MM-DD, or null>", "time": "<HH:MM in 24h format, or null>"}}
 
-Only set "date"/"time" if the customer gave enough information to resolve an actual calendar \
-date and time (e.g. "next Tuesday", "tomorrow at 2pm", "July 15th at 10am") — resolve relative \
-dates using today's date above. Only set "service" if it clearly matches one of the available \
-services listed above (case-insensitive match is fine, but the value you return must be the \
-exact listed name).
+Set "date" and "time" INDEPENDENTLY — do not require both to be present:
+- Set "date" whenever the customer names a resolvable day, EVEN WITHOUT a time \
+("Friday", "next Tuesday", "the 15th", "tomorrow", "this weekend" -> pick the nearest matching \
+day). Resolve relative days using today's date above.
+- Set "time" whenever the customer gives a clock time, EVEN WITHOUT a day ("2pm", "at ten", \
+"half past nine").
+- A day alone -> set "date", leave "time" null. A time alone -> set "time", leave "date" null. \
+Only leave a field null when that specific piece (the day, or the clock time) is genuinely absent \
+from the message.
+
+Only set "service" if it clearly matches one of the available services listed above \
+(case-insensitive match is fine, but the value you return must be the exact listed name).
 """
 
 

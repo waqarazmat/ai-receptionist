@@ -47,6 +47,22 @@ DETAILS_LOST_MESSAGE = (
 
 _CANCEL_RE = re.compile(r"\b(cancel|nevermind|never mind|forget it|stop|start over)\b", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# At CONFIRMING, a request to hear/verify the details again ("read back the
+# email", "confirm my email", "repeat that", "spell my name") — as opposed to a
+# yes/no or a correction. Checked BEFORE the yes/no match so "confirm my email"
+# re-reads the details instead of booking, while a bare "confirm"/"confirm it"
+# still books (the object list here is name/email/details, not "booking").
+_REVIEW_REQUEST_RE = re.compile(
+    r"\b(?:"
+    r"read\s+(?:it|that|the|my|back)"
+    r"|repeat|say\s+(?:it|that)\s+again"
+    r"|spell\s+(?:it|that|my|the)"
+    r"|hear\s+(?:it|that|my|the)"
+    r"|(?:confirm|check|verify|review|go\s+over)\s+(?:my\s+|the\s+)?(?:e-?mail|name|details|spelling|address|info(?:rmation)?)"
+    r"|what(?:'?s| is)\s+my\s+(?:e-?mail|name)"
+    r")\b",
+    re.IGNORECASE,
+)
 
 # During the service/time-collection steps, a bare answer ("cleaning", "sun 1pm")
 # classifies as faq/off_topic, NOT a booking intent — so to keep the booking alive
@@ -451,6 +467,16 @@ async def process_booking_intent(
         # correction and, if one is found, apply it and RE-READ-BACK rather than
         # looping "Sorry, should I go ahead and book that? (yes/no)".
         text = user_input or ""
+        # The caller wants to hear/verify the details again ("read back the
+        # email", "confirm my email", "repeat that") — re-read them back instead
+        # of booking or looping yes/no. Checked FIRST so "confirm my email" is a
+        # review, not a booking confirmation (that bug booked with a wrong email).
+        if _REVIEW_REQUEST_RE.search(text):
+            await fsm.save()
+            if channel == "voice":
+                return _build_voice_confirmation(fsm.collected_data, org_tz)
+            return fsm._confirmation_result().response_text
+
         pure_yes = bool(_AFFIRMATIVE_RE.search(text)) and not bool(_NEGATIVE_RE.search(text))
         if not pure_yes:
             extracted = await _extract_contact_info(db, org_id, user_input)
@@ -510,11 +536,14 @@ async def process_booking_intent(
 
     if new_state == BookingState.COLLECTING_SERVICE and service_by_name:
         response_text += " We offer: " + ", ".join(service_by_name.keys()) + "."
-    elif new_state == BookingState.COLLECTING_TIME and previous_state != BookingState.COLLECTING_TIME:
-        # Only offer the open-times list the FIRST time we enter this step.
-        # Re-dumping all six slots on every turn the caller stays in
-        # COLLECTING_TIME (e.g. an unparsed reply, or while spelling a name) is
-        # the "consultation slots repeated over and over" bug.
+    elif new_state == BookingState.COLLECTING_TIME and not (
+        fsm.collected_data.get("date") or fsm.collected_data.get("time")
+    ):
+        # Offer the open-times list when the caller is still at square one — no day
+        # AND no time captured yet (first entry, or a reply that gave neither).
+        # Once they've given a partial (e.g. just a day), the FSM asks a targeted
+        # follow-up instead, so we don't re-dump every slot each turn (the
+        # "consultation slots repeated over and over" complaint).
         service = service_by_name.get(fsm.collected_data.get("service", ""), {})
         duration = service.get("duration_minutes", DEFAULT_SERVICE_DURATION_MINUTES)
         slots = await _next_available_slots(db, org_id, duration, org_tz)
