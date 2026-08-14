@@ -16,9 +16,11 @@ from app.ai.llm_router import (
 from app.ai.prompts.booking_prompts import get_booking_extraction_prompt, get_contact_info_extraction_prompt
 from app.config import settings
 from app.booking import slot_manager
-from app.booking.fsm import BookingFSM, BookingState
+from app.booking.fsm import _AFFIRMATIVE_RE, _NEGATIVE_RE, BookingFSM, BookingState
 from app.booking.google_calendar import GoogleCalendarClient, GoogleCalendarError
 from app.booking.slot_manager import resolve_org_timezone
+from app.db.engine import async_session_maker
+from app.models.appointment import Appointment
 from app.models.contact import Contact
 from app.models.organization import Organization
 from app.services import appointment_service
@@ -567,19 +569,89 @@ async def _enqueue_confirmation_email(
 
 
 async def _create_calendar_event(
-    db: AsyncSession, org_id: uuid.UUID, org_timezone_name: str, service_name: str, contact, start, end
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    org_timezone_name: str,
+    service_name: str,
+    contact_name: str | None,
+    contact_email: str | None,
+    start,
+    end,
 ) -> str | None:
-    """Build the org's calendar client and create the event — together, so
-    _finalize_booking can bound the whole thing (build + create) under a single
-    timeout. Raises GoogleCalendarError on config/API failure."""
+    """Build the org's calendar client and create the event — together, so the
+    caller can bound the whole thing (build + create) under a single timeout.
+    Raises GoogleCalendarError on config/API failure."""
     client = await GoogleCalendarClient.for_org(db, org_id)
     return await client.create_event(
-        summary=f"{service_name} — {contact.name if contact else 'Customer'}",
+        summary=f"{service_name} — {contact_name or 'Customer'}",
         start=start,
         end=end,
-        attendee_email=contact.email if contact else None,
+        attendee_email=contact_email,
         time_zone=org_timezone_name,
     )
+
+
+# Fire-and-forget booking side-effect tasks are tracked in a module set so the
+# event loop keeps a strong reference to them until they finish (otherwise a
+# background task can be garbage-collected mid-flight).
+_booking_side_effect_tasks: set = set()
+
+
+def _spawn_booking_side_effects(coro) -> None:
+    task = asyncio.create_task(coro)
+    _booking_side_effect_tasks.add(task)
+    task.add_done_callback(_booking_side_effect_tasks.discard)
+
+
+async def _run_booking_side_effects(
+    org_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    service_name: str,
+    start,
+    end,
+    org_timezone_name: str,
+    contact_name: str | None,
+    contact_email: str | None,
+    customer_email: str | None,
+) -> None:
+    """Create the Google Calendar event and send the confirmation email AFTER the
+    booking is already saved and confirmed to the customer — so neither can ever
+    delay or hang the confirmation reply (the repeated "stuck on yes" freeze).
+
+    Runs on its OWN DB session (the request's session is gone by now), bounds the
+    calendar call with a timeout, and swallows every error: these are best-effort
+    niceties; the actual booking is already committed."""
+    # 1. Calendar event — bounded + best-effort. On success, backfill the id.
+    try:
+        async with async_session_maker() as db:
+            event_id = await asyncio.wait_for(
+                _create_calendar_event(
+                    db, org_id, org_timezone_name, service_name, contact_name, contact_email, start, end
+                ),
+                timeout=settings.CALENDAR_EVENT_TIMEOUT_SECONDS,
+            )
+            if event_id:
+                appt = await db.get(Appointment, appointment_id)
+                if appt is not None:
+                    appt.google_event_id = event_id
+                    await db.commit()
+    except (GoogleCalendarError, asyncio.TimeoutError) as exc:
+        logger.warning("calendar_event_create_failed", org_id=str(org_id), error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — a background side effect must never crash
+        logger.warning("booking_calendar_side_effect_failed", org_id=str(org_id), error=str(exc))
+
+    # 2. Confirmation email — best-effort (already internally guarded), bounded too.
+    if customer_email:
+        try:
+            async with async_session_maker() as db:
+                await asyncio.wait_for(
+                    _enqueue_confirmation_email(
+                        db, org_id, customer_email, contact_name, service_name, start
+                    ),
+                    timeout=settings.CALENDAR_EVENT_TIMEOUT_SECONDS,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("confirmation_email_enqueue_failed", org_id=str(org_id), error=str(exc))
 
 
 async def _finalize_booking(
@@ -615,30 +687,11 @@ async def _finalize_booking(
 
     try:
         contact = await db.get(Contact, contact_id)
-        google_event_id = None
-        try:
-            # Bound the ENTIRE calendar interaction — building the client (for_org)
-            # AND the create call — under one timeout, so nothing calendar-related
-            # can freeze the booking after "yes". The client build now runs off the
-            # event loop (GoogleCalendarClient.for_org uses a thread), so this
-            # wait_for can actually fire even if the build would otherwise block.
-            google_event_id = await asyncio.wait_for(
-                _create_calendar_event(db, org_id, org_timezone_name, service_name, contact, start, end),
-                timeout=settings.CALENDAR_EVENT_TIMEOUT_SECONDS,
-            )
-        except (GoogleCalendarError, asyncio.TimeoutError) as exc:
-            # Booking still proceeds without a calendar event — staff see it
-            # in the appointments list and can add it to the calendar
-            # manually; that's better than losing the booking outright (or
-            # hanging the conversation waiting on Google).
-            logger.warning("calendar_event_create_failed", org_id=str(org_id), error=str(exc))
-
-        # Postgres stores timestamptz internally as UTC regardless of the
-        # tzinfo passed in, but converting explicitly here keeps what's
-        # actually sent over the wire unambiguous — the org's local
-        # timezone is already recorded on Organization.timezone, so nothing
-        # about the local time is lost by storing the UTC instant.
-        await appointment_service.create_appointment(
+        # Save the appointment NOW — this IS the booking. The Google Calendar
+        # event id is backfilled later by the background task. Postgres stores
+        # timestamptz as UTC regardless; converting explicitly just keeps what's
+        # sent over the wire unambiguous.
+        appointment = await appointment_service.create_appointment(
             db,
             org_id,
             contact_id,
@@ -646,19 +699,30 @@ async def _finalize_booking(
             service_name,
             start.astimezone(timezone.utc),
             end.astimezone(timezone.utc),
-            google_event_id,
+            None,
         )
-
-        # Immediate booking-confirmation email to the customer (queued to the
-        # worker — never blocks the reply). Followed later by the 24h + 1h
-        # reminder emails from the reminder cron.
-        customer_email = fsm.collected_data.get("customer_email") or (contact.email if contact else None)
-        if customer_email:
-            await _enqueue_confirmation_email(
-                db, org_id, customer_email, contact.name if contact else None, service_name, start
-            )
     finally:
         await slot_manager.release_slot(org_id, start, contact_id)
+
+    # The slow external side effects — Google Calendar event + confirmation email
+    # — run in the BACKGROUND so the confirmation is returned to the customer
+    # IMMEDIATELY and can never hang waiting on Google or the email queue (the
+    # cause of the repeated "stuck after yes" freeze). The booking itself is
+    # already durably committed above.
+    customer_email = fsm.collected_data.get("customer_email") or (contact.email if contact else None)
+    _spawn_booking_side_effects(
+        _run_booking_side_effects(
+            org_id,
+            appointment.id,
+            service_name,
+            start,
+            end,
+            org_timezone_name,
+            contact.name if contact else None,
+            contact.email if contact else None,
+            customer_email,
+        )
+    )
 
     return (
         f"You're all set! I've booked your {service_name} for {start.strftime('%A, %B %d')} at "
