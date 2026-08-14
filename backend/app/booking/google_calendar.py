@@ -118,7 +118,12 @@ class GoogleCalendarClient:
 
         calendar_id = decrypt_api_key(str(org_id), key_row.encrypted_key)
         logger.info("google_calendar_client_configured", org_id=str(org_id), calendar_id=calendar_id)
-        return cls(org_id, calendar_id)
+        # Build the client OFF the event loop. The constructor calls
+        # googleapiclient.discovery.build(), which is synchronous and can block
+        # on network (credential/discovery handling) — running it inline would
+        # freeze the whole loop, and no asyncio.wait_for around this could ever
+        # fire. In a thread it stays cancellable/bounded by the caller's timeout.
+        return await asyncio.to_thread(cls, org_id, calendar_id)
 
     @staticmethod
     def _run(fn):

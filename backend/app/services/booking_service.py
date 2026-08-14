@@ -566,6 +566,22 @@ async def _enqueue_confirmation_email(
         logger.warning("confirmation_email_enqueue_failed", org_id=str(org_id))
 
 
+async def _create_calendar_event(
+    db: AsyncSession, org_id: uuid.UUID, org_timezone_name: str, service_name: str, contact, start, end
+) -> str | None:
+    """Build the org's calendar client and create the event — together, so
+    _finalize_booking can bound the whole thing (build + create) under a single
+    timeout. Raises GoogleCalendarError on config/API failure."""
+    client = await GoogleCalendarClient.for_org(db, org_id)
+    return await client.create_event(
+        summary=f"{service_name} — {contact.name if contact else 'Customer'}",
+        start=start,
+        end=end,
+        attendee_email=contact.email if contact else None,
+        time_zone=org_timezone_name,
+    )
+
+
 async def _finalize_booking(
     db: AsyncSession,
     org_id: uuid.UUID,
@@ -601,19 +617,13 @@ async def _finalize_booking(
         contact = await db.get(Contact, contact_id)
         google_event_id = None
         try:
-            client = await GoogleCalendarClient.for_org(db, org_id)
-            # Bound the whole create call (auth-token fetch + insert) so a slow or
-            # hanging Calendar API can never freeze the booking mid-confirmation —
-            # which otherwise left the customer staring at a "typing…" indicator
-            # forever after they said yes.
+            # Bound the ENTIRE calendar interaction — building the client (for_org)
+            # AND the create call — under one timeout, so nothing calendar-related
+            # can freeze the booking after "yes". The client build now runs off the
+            # event loop (GoogleCalendarClient.for_org uses a thread), so this
+            # wait_for can actually fire even if the build would otherwise block.
             google_event_id = await asyncio.wait_for(
-                client.create_event(
-                    summary=f"{service_name} — {contact.name if contact else 'Customer'}",
-                    start=start,
-                    end=end,
-                    attendee_email=contact.email if contact else None,
-                    time_zone=org_timezone_name,
-                ),
+                _create_calendar_event(db, org_id, org_timezone_name, service_name, contact, start, end),
                 timeout=settings.CALENDAR_EVENT_TIMEOUT_SECONDS,
             )
         except (GoogleCalendarError, asyncio.TimeoutError) as exc:
