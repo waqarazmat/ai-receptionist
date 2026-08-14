@@ -84,6 +84,40 @@ _SCHEDULING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Availability / slot / appointment language — a customer asking to book or
+# check open times, even when phrased as a question ("do you have any open
+# slots?", "are you open Friday at three PM?"). These often classify as faq and
+# then get DEFLECTED ("I can't check availability, let me connect you with the
+# team") instead of shown real open times — so we route them into the booking
+# flow, which lists actual openings.
+_BOOKING_INQUIRY_RE = re.compile(
+    r"\b(book|booking|appointment|schedul|reschedul|reserve|"
+    r"availabilit(?:y|ies)|(?:open|free|available)\s+slots?|slots?\s+(?:available|open|free)|"
+    r"any\s+(?:open(?:ing)?s?|slots?|times?)|make\s+an?\s+appointment|"
+    r"come\s+in\s+for|set\s+up\s+(?:an?\s+)?(?:appointment|time|visit))\b",
+    re.IGNORECASE,
+)
+# A spoken/typed clock time, digit ("3pm", "3:00") or word ("three PM").
+_TIME_MENTION_RE = re.compile(
+    r"\b(\d{1,2}(:\d{2})?\s*(am|pm|a\.m\.|p\.m\.|o'?clock)|"
+    r"(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*(am|pm|o'?clock)|"
+    r"noon|midday|midnight)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_booking_inquiry(text: str) -> bool:
+    """True when a not-yet-booking message is really an availability/booking
+    request that should open the booking flow rather than be answered as FAQ."""
+    if _BOOKING_INQUIRY_RE.search(text or ""):
+        return True
+    # "are you open Friday at three PM?" — asking whether a SPECIFIC time is open
+    # is an availability check (booking), not an opening-hours question. A plain
+    # "are you open on Sundays?" (a day, no clock time) is left to FAQ/RAG.
+    if re.search(r"\bopen\b", text or "", re.IGNORECASE) and _TIME_MENTION_RE.search(text or ""):
+        return True
+    return False
+
 
 def _looks_like_question(text: str) -> bool:
     return bool(_QUESTION_RE.search(text or ""))
@@ -314,8 +348,11 @@ def should_route_to_booking(
       nor silently dropped out of the booking when they answer it.
     """
     if not booking_active:
-        # No booking in progress yet — only a booking-shaped intent starts one.
-        return intent in _BOOKING_INTENTS
+        # No booking in progress yet — a booking-shaped intent starts one, and so
+        # does an availability/slot/appointment inquiry that the classifier may
+        # have tagged as faq (otherwise "do you have open slots?" gets deflected
+        # instead of shown real open times).
+        return intent in _BOOKING_INTENTS or _looks_like_booking_inquiry(message_text)
 
     # A booking is mid-flow.
     if booking_state in STICKY_BOOKING_STATES:

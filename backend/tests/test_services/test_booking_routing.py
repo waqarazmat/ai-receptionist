@@ -15,6 +15,44 @@ from app.services import booking_service
 from app.services.booking_service import STICKY_BOOKING_STATES, should_route_to_booking
 
 
+class TestBookingInquiryDetection:
+    """Availability/slot/appointment questions (often mis-tagged as faq) must
+    open the booking flow instead of being deflected ("I can't check availability")."""
+
+    @pytest.mark.parametrize("text", [
+        "do you have any open slots available?",
+        "can you check if you are open on Friday, three PM?",
+        "any openings tomorrow?",
+        "can I make an appointment",
+        "do you have availability next week",
+        "open slot at 3pm?",
+    ])
+    def test_availability_questions_are_booking_inquiries(self, text):
+        assert booking_service._looks_like_booking_inquiry(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "are you open on Sundays?",
+        "what are your opening hours?",
+        "do you have parking available?",
+        "where are you located?",
+        "how much is a cleaning?",
+        "are you open today?",
+    ])
+    def test_non_booking_questions_stay_faq(self, text):
+        assert booking_service._looks_like_booking_inquiry(text) is False
+
+    def test_idle_availability_question_routes_into_booking(self):
+        # faq intent + availability wording → still opens the booking flow.
+        assert should_route_to_booking(
+            False, BookingState.IDLE, "faq", "do you have any open slots available?"
+        ) is True
+
+    def test_idle_hours_question_stays_faq(self):
+        assert should_route_to_booking(
+            False, BookingState.IDLE, "faq", "are you open on Sundays?"
+        ) is False
+
+
 class TestShouldRouteToBooking:
     # ── booking-shaped intents always route in (start or continue a booking) ──
     def test_booking_request_routes_in_even_when_idle(self):
