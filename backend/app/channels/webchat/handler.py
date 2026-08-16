@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 
@@ -135,12 +136,34 @@ async def chat_join(sid: str, data: dict | None = None) -> None:
         await _resolve_conversation(db, sid, session)
 
 
+# One asyncio.Lock per connected sid so a single chat processes its messages
+# SEQUENTIALLY. Two quick messages ("opening hours?" then "which services?")
+# otherwise ran as concurrent coroutines and their streamed replies collided on
+# the widget's single streaming bubble, so one answer was silently dropped.
+_send_locks: dict[str, asyncio.Lock] = {}
+
+
+def _send_lock(sid: str) -> asyncio.Lock:
+    lock = _send_locks.get(sid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _send_locks[sid] = lock
+    return lock
+
+
 @sio.on("send_message", namespace="/chat")
 async def chat_send_message(sid: str, data: dict | None) -> None:
-    session = await sio.get_session(sid, namespace="/chat")
     message_text = ((data or {}).get("message") or "").strip()
     if not message_text:
         return
+    # Serialize per connection so two quick questions each get their own complete
+    # reply, in order — instead of racing and clobbering each other's stream.
+    async with _send_lock(sid):
+        await _process_send_message(sid, message_text)
+
+
+async def _process_send_message(sid: str, message_text: str) -> None:
+    session = await sio.get_session(sid, namespace="/chat")
 
     # Per-stage timing (analyze / embed / RAG / time-to-first-token / total) so a
     # load test's numbers are interpretable from one `message_timing` log line —
@@ -294,4 +317,6 @@ async def chat_send_message(sid: str, data: dict | None) -> None:
 @sio.on("disconnect", namespace="/chat")
 async def chat_disconnect(sid: str) -> None:
     session = await sio.get_session(sid, namespace="/chat")
+    # Drop this connection's serialization lock so it doesn't linger forever.
+    _send_locks.pop(sid, None)
     logger.info("webchat_disconnected", conversation_id=session.get("conversation_id"), sid=sid)
