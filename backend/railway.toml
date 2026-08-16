@@ -8,12 +8,12 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Run migrations before every deploy — but ONLY on the web service. The worker
-# (RUN_WORKER=true) skips them via the script: it doesn't need to migrate, and
-# alembic in the worker's one-shot pre-deploy container was failing to reach
-# Postgres and aborting the deploy. The web service still runs the migration;
-# if it fails there, the deploy aborts and the previous version keeps serving.
-preDeployCommand = "bash railway-predeploy.sh"
+# NOTE: migrations are NOT run in a preDeployCommand anymore. Railway's one-shot
+# pre-deploy container could not reach Postgres over the private network — it
+# fell back to the public proxy and the SSL handshake got reset ("[Errno 104]
+# Connection reset by peer"), aborting every deploy. Migrations now run inside
+# railway-start.sh (the MAIN app container, which reaches Postgres reliably),
+# for the web service only, with retries. See railway-start.sh.
 
 # One start command for BOTH services — railway-start.sh branches on RUN_WORKER
 # ($PORT is injected by Railway). This is the START (deploy) command, not a
