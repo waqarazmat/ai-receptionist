@@ -4,6 +4,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm_router import (
@@ -22,6 +23,7 @@ from app.booking.slot_manager import resolve_org_timezone
 from app.db.engine import async_session_maker
 from app.models.appointment import Appointment
 from app.models.contact import Contact
+from app.models.enums import AppointmentStatus
 from app.models.organization import Organization
 from app.services import appointment_service
 from app.tasks.queue import get_arq_pool
@@ -34,7 +36,9 @@ SLOTS_LOOKAHEAD_DAYS = 7
 # Slot suggestions span multiple open days (rather than dumping one day's whole
 # schedule) so the customer can see several days/times are available.
 MAX_SUGGESTED_DAYS = 3
-MAX_SUGGESTED_SLOTS = 6
+# Only ever offer the nearest few openings — a caller (especially on voice)
+# can't hold six times in their head. One per open day gives a spread of three.
+MAX_SUGGESTED_SLOTS = 3
 
 FALLBACK_MESSAGE = (
     "We're having trouble with booking right now — please call us directly and our team will "
@@ -133,6 +137,156 @@ def _looks_like_booking_inquiry(text: str) -> bool:
     if re.search(r"\bopen\b", text or "", re.IGNORECASE) and _TIME_MENTION_RE.search(text or ""):
         return True
     return False
+
+
+# --- Deterministic day resolution -------------------------------------------
+# The fast-tier extraction LLM cannot reliably compute weekday->date arithmetic
+# (it resolved "sunday" to a Thursday date, so the closed-day check never fired
+# and it booked the wrong day). When the customer names a day OUTRIGHT — a
+# weekday, "today", or "tomorrow" — we compute the calendar date ourselves and
+# trust it over the model's guess.
+_WEEKDAYS = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tues": 1, "tue": 1,
+    "wednesday": 2, "weds": 2, "wed": 2,
+    "thursday": 3, "thurs": 3, "thur": 3, "thu": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+_WEEKDAY_RE = re.compile(
+    r"\b(next\s+|this\s+(?:coming\s+)?)?"
+    r"(monday|mon|tuesday|tues|tue|wednesday|weds|wed|thursday|thurs|thur|thu|friday|fri|saturday|sat|sunday|sun)\b",
+    re.IGNORECASE,
+)
+_TODAY_RE = re.compile(r"\btoday\b", re.IGNORECASE)
+_TOMORROW_RE = re.compile(r"\btomorrow\b", re.IGNORECASE)
+
+
+def _resolve_explicit_day(text: str, today: date) -> date | None:
+    """Resolve a day the customer named plainly ("monday", "next fri", "today",
+    "tomorrow") to a real date, in the org's timezone. Returns None when the
+    message names no such day (e.g. "the 15th" — left to the LLM, which handles
+    explicit day-of-month better than weekday arithmetic)."""
+    if not text:
+        return None
+    if _TOMORROW_RE.search(text):
+        return today + timedelta(days=1)
+    m = _WEEKDAY_RE.search(text)
+    if m:
+        target = _WEEKDAYS[m.group(2).lower()]
+        delta = (target - today.weekday()) % 7  # 0..6; today counts as "this <day>"
+        if m.group(1) and m.group(1).lower().startswith("next") and delta == 0:
+            delta = 7  # "next monday" said on a Monday -> the following week
+        return today + timedelta(days=delta)
+    if _TODAY_RE.search(text):
+        return today
+    return None
+
+
+# A caller picks from the slots we just read out either by position ("the first
+# one", "the second") or by the time we spoke ("the 10:30"). The fast-tier LLM
+# often can't turn "the first one" into a date, so we map the reference back to
+# the exact slot we offered, deterministically.
+_ORDINAL_INDEX = {
+    "first": 0, "1st": 0,
+    "second": 1, "2nd": 1,
+    "third": 2, "3rd": 2,
+    "fourth": 3, "4th": 3,
+    "fifth": 4, "5th": 4,
+}
+_ORDINAL_RE = re.compile(r"\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\b", re.IGNORECASE)
+# A spoken clock time: "10:30" (colon form) or "9 am"/"3pm" (hour + am/pm). Bare
+# numbers with neither a colon nor am/pm are ignored, so "17 aug" isn't read as a
+# time. Matched against the KNOWN offered slots, which keeps it unambiguous.
+_CLOCK_COLON_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
+_CLOCK_AMPM_RE = re.compile(r"\b(\d{1,2})\s*(a\.?m\.?|p\.?m\.?)\b", re.IGNORECASE)
+
+
+def _slot_matches_spoken_time(slot: datetime, text: str) -> bool:
+    for m in _CLOCK_COLON_RE.finditer(text):
+        h, mn = int(m.group(1)), int(m.group(2))
+        if mn == slot.minute and slot.hour % 12 == h % 12:  # 1:30 matches 13:30
+            return True
+    for m in _CLOCK_AMPM_RE.finditer(text):
+        h = int(m.group(1)) % 12 + (12 if m.group(2).lower().startswith("p") else 0)
+        if slot.hour == h:
+            return True
+    return False
+
+
+def _resolve_offered_slot(text: str, offered_iso: list[str], extracted_time: str | None) -> datetime | None:
+    """Map a reply that refers to one of the slots we just offered back to that
+    exact slot, or None if it references none. `offered_iso` are the slot start
+    times (org-local, ISO) we last presented; `extracted_time` is the HH:MM the
+    LLM parsed from this reply, if any."""
+    slots: list[datetime] = []
+    for iso in offered_iso or []:
+        try:
+            slots.append(datetime.fromisoformat(iso))
+        except (ValueError, TypeError):
+            continue
+    if not slots:
+        return None
+    lowered = (text or "").lower()
+    if re.search(r"\blast\b", lowered):
+        return slots[-1]
+    m = _ORDINAL_RE.search(lowered)
+    if m:
+        idx = _ORDINAL_INDEX.get(m.group(1).lower())
+        if idx is not None and idx < len(slots):
+            return slots[idx]
+    if extracted_time:
+        for s in slots:
+            if s.strftime("%H:%M") == extracted_time:
+                return s
+    for s in slots:
+        if _slot_matches_spoken_time(s, text or ""):
+            return s
+    return None
+
+
+# --- Cancel / reschedule of an ALREADY-booked appointment -------------------
+# Distinct from _CANCEL_RE (which aborts an in-progress booking attempt): these
+# act on an appointment the customer previously committed. Both require an
+# appointment-ish object so a bare "cancel"/"change" mid-flow can't trigger them.
+_CANCEL_APPT_RE = re.compile(
+    r"\b(cancel|delete|remove|drop|call\s+off)\b.{0,30}\b(appointment|booking|reservation|slot|visit)\b"
+    r"|\bcancel\s+(?:my|the|it)\b",
+    re.IGNORECASE,
+)
+_RESCHEDULE_APPT_RE = re.compile(
+    r"\breschedul\w*|\bre-schedul\w*"
+    r"|\b(change|move|shift|switch|push\s+back|bring\s+forward)\b.{0,30}\b(appointment|booking|time|slot|visit)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_cancel_appointment(text: str) -> bool:
+    return bool(_CANCEL_APPT_RE.search(text or ""))
+
+
+def _wants_reschedule_appointment(text: str) -> bool:
+    return bool(_RESCHEDULE_APPT_RE.search(text or ""))
+
+
+async def _find_upcoming_appointment(
+    db: AsyncSession, org_id: uuid.UUID, contact_id: uuid.UUID
+) -> Appointment | None:
+    """The customer's next confirmed, still-upcoming appointment (the one a
+    'cancel'/'reschedule' request refers to), or None if they have none."""
+    stmt = (
+        select(Appointment)
+        .where(
+            Appointment.org_id == org_id,
+            Appointment.contact_id == contact_id,
+            Appointment.status == AppointmentStatus.confirmed,
+            Appointment.start_time >= datetime.now(timezone.utc),
+        )
+        .order_by(Appointment.start_time)
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
 
 
 def _looks_like_question(text: str) -> bool:
@@ -440,6 +594,62 @@ async def process_booking_intent(
 
     previous_state = fsm.current_state
 
+    # Reuse the customer's known identity across bookings in this conversation:
+    # once they've given a name/email (persisted on the Contact), a SECOND
+    # booking must NOT ask for them again — "use what I gave earlier" should just
+    # work, and the flow skips straight to confirmation.
+    contact = await db.get(Contact, contact_id)
+    if contact is not None:
+        if not fsm.collected_data.get("customer_name") and contact.name:
+            fsm.collected_data["customer_name"] = contact.name
+        if not fsm.collected_data.get("customer_email") and _is_valid_email(contact.email):
+            fsm.collected_data["customer_email"] = contact.email
+
+    # Cancel / reschedule of an appointment the customer ALREADY booked. Only
+    # entertained when we're not deep in collecting a new booking's details, so a
+    # stray "change"/"move" inside the flow can't hijack it.
+    if previous_state in (BookingState.IDLE, BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
+        if _wants_cancel_appointment(user_input):
+            appt = await _find_upcoming_appointment(db, org_id, contact_id)
+            if appt is not None:
+                when = appt.start_time.astimezone(org_tz)
+                try:
+                    await appointment_service.cancel_appointment(db, org_id, appt.id)
+                except Exception as exc:  # noqa: BLE001 — never surface a crash to the customer
+                    logger.warning("appointment_cancel_failed", org_id=str(org_id), error=str(exc))
+                    return "Sorry, I ran into a problem cancelling that — please call us and we'll sort it out."
+                await fsm.clear()
+                return (
+                    f"Done — I've cancelled your {appt.service_name} on "
+                    f"{when.strftime('%A, %B %d')} at {_format_time(when)}. "
+                    "Let me know if you'd like to book a new time."
+                )
+            return (
+                "I couldn't find an upcoming appointment under your details to cancel. "
+                "Would you like to book a new one?"
+            )
+
+        if _wants_reschedule_appointment(user_input):
+            appt = await _find_upcoming_appointment(db, org_id, contact_id)
+            if appt is not None:
+                when = appt.start_time.astimezone(org_tz)
+                # Start a fresh time-collection, remembering which appointment to
+                # replace (cancelled in _finalize_booking once the new one commits)
+                # and reusing the service + known name/email so we only re-ask time.
+                fsm.collected_data = {"service": appt.service_name, "reschedule_of": str(appt.id)}
+                if contact is not None and contact.name:
+                    fsm.collected_data["customer_name"] = contact.name
+                if contact is not None and _is_valid_email(contact.email):
+                    fsm.collected_data["customer_email"] = contact.email
+                fsm.current_state = BookingState.COLLECTING_TIME
+                await fsm.save()
+                return (
+                    f"Sure — your {appt.service_name} is currently on "
+                    f"{when.strftime('%A, %B %d')} at {_format_time(when)}. "
+                    "What day and time would you like to move it to?"
+                )
+            # No existing appointment — fall through and treat it as a new booking.
+
     # Extract on the opening message (IDLE) too — details the customer already
     # gave ("book a cleaning tomorrow at 2pm") must not be thrown away and re-asked.
     if previous_state in (BookingState.IDLE, BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
@@ -452,6 +662,25 @@ async def process_booking_intent(
             fsm.collected_data["date"] = extracted["date"]
         if extracted.get("time"):
             fsm.collected_data["time"] = extracted["time"]
+
+        # Override the LLM's date whenever the customer named a day outright — the
+        # fast-tier model gets weekday->date arithmetic wrong (booked "monday" as
+        # a Friday, and never caught that "sunday" is a closed day). This resolves
+        # it deterministically in the org's timezone.
+        explicit_day = _resolve_explicit_day(user_input, datetime.now(org_tz).date())
+        if explicit_day is not None:
+            fsm.collected_data["date"] = explicit_day.isoformat()
+
+        # The caller may be picking a slot we just read out ("the first one", "the
+        # 10:30") — resolve that to the exact offered slot when we don't already
+        # hold a full date+time, so their selection isn't lost and re-asked.
+        if not (fsm.collected_data.get("date") and fsm.collected_data.get("time")):
+            picked = _resolve_offered_slot(
+                user_input, fsm.collected_data.get("offered_slots") or [], fsm.collected_data.get("time")
+            )
+            if picked is not None:
+                fsm.collected_data["date"] = picked.date().isoformat()
+                fsm.collected_data["time"] = picked.strftime("%H:%M")
 
         # If the requested day is one the practice is CLOSED (e.g. a weekend),
         # say so immediately and ask for another day — don't accept the day and
@@ -488,9 +717,11 @@ async def process_booking_intent(
             if not slot_valid:
                 fsm.collected_data.pop("date", None)
                 fsm.collected_data.pop("time", None)
-                await fsm.save()
                 # Show only a few nearest alternatives, not the whole list again.
-                alternatives = (await _next_available_slots(db, org_id, duration, org_tz))[:3]
+                alternatives = (await _next_available_slots(db, org_id, duration, org_tz))[:MAX_SUGGESTED_SLOTS]
+                # Remember what we offered so "the first one"/"the 10:30" resolves.
+                fsm.collected_data["offered_slots"] = [s.isoformat() for s in alternatives]
+                await fsm.save()
                 if alternatives:
                     return (
                         f"Sorry, that time isn't available. The nearest openings are "
@@ -592,10 +823,21 @@ async def process_booking_intent(
     new_state = BookingState(result["new_state"])
 
     if new_state == BookingState.BOOKED:
-        response_text = await _finalize_booking(
+        success, response_text = await _finalize_booking(
             db, org_id, conversation_id, contact_id, fsm, service_by_name, org_tz, org_timezone_name
         )
-        await fsm.clear()
+        if success:
+            await fsm.clear()
+        else:
+            # The booking couldn't complete (its time went missing or the slot was
+            # just taken). Do NOT drop the session — that made voice callers hear
+            # "how can I help you?" and lose their name/slot mid-call. Keep the
+            # collected identity and step back to time selection so they can pick
+            # another slot without being re-asked their name/email.
+            fsm.current_state = BookingState.COLLECTING_TIME
+            fsm.collected_data.pop("date", None)
+            fsm.collected_data.pop("time", None)
+            await fsm.save()
         return response_text
 
     response_text = result["response_text"]
@@ -625,6 +867,9 @@ async def process_booking_intent(
         duration = service.get("duration_minutes", DEFAULT_SERVICE_DURATION_MINUTES)
         slots = await _next_available_slots(db, org_id, duration, org_tz)
         if slots:
+            # Remember what we offered so a "the first one"/"the 10:30" reply next
+            # turn resolves to the exact slot instead of being lost.
+            fsm.collected_data["offered_slots"] = [s.isoformat() for s in slots]
             response_text += f" Some open times: {_format_slot_options(slots, channel)}."
 
     await fsm.save()
@@ -769,13 +1014,16 @@ async def _finalize_booking(
     service_by_name: dict,
     org_tz,
     org_timezone_name: str,
-) -> str:
+) -> tuple[bool, str]:
+    """Returns (success, message). On failure the caller keeps the booking
+    session alive (rather than dropping it) so the customer can pick another
+    time without re-giving their name/email or losing the call's context."""
     service_name = fsm.collected_data.get("service")
     date_str = fsm.collected_data.get("date")
     time_str = fsm.collected_data.get("time")
     start = _parse_slot_datetime(date_str, time_str, org_tz) if date_str and time_str else None
     if not (service_name and start):
-        return DETAILS_LOST_MESSAGE
+        return False, DETAILS_LOST_MESSAGE
 
     service = service_by_name.get(service_name, {})
     duration = service.get("duration_minutes", DEFAULT_SERVICE_DURATION_MINUTES)
@@ -783,13 +1031,13 @@ async def _finalize_booking(
 
     held = await slot_manager.hold_slot(org_id, start, contact_id)
     if not held:
-        return "Sorry, that slot was just taken by someone else. Could you pick another time?"
+        return False, "Sorry, that slot was just taken by someone else. Could you pick another time?"
 
     # Final guard against an overlapping appointment created between slot
     # validation and now (the Redis hold only covers this exact start time).
     if await slot_manager.has_conflicting_appointment(db, org_id, start, end):
         await slot_manager.release_slot(org_id, start, contact_id)
-        return "Sorry, that slot was just taken by someone else. Could you pick another time?"
+        return False, "Sorry, that slot was just taken by someone else. Could you pick another time?"
 
     try:
         contact = await db.get(Contact, contact_id)
@@ -809,6 +1057,15 @@ async def _finalize_booking(
         )
     finally:
         await slot_manager.release_slot(org_id, start, contact_id)
+
+    # If this booking is a RESCHEDULE, cancel the ORIGINAL appointment now that
+    # the replacement is safely committed (this also cancels its Calendar event).
+    reschedule_of = fsm.collected_data.get("reschedule_of")
+    if reschedule_of:
+        try:
+            await appointment_service.cancel_appointment(db, org_id, uuid.UUID(reschedule_of))
+        except Exception as exc:  # noqa: BLE001 — the new booking already stands
+            logger.warning("reschedule_cancel_old_failed", org_id=str(org_id), error=str(exc))
 
     # The slow external side effects — Google Calendar event + confirmation email
     # — run in the BACKGROUND so the confirmation is returned to the customer
@@ -830,7 +1087,8 @@ async def _finalize_booking(
         )
     )
 
-    return (
-        f"You're all set! I've booked your {service_name} for {start.strftime('%A, %B %d')} at "
+    verb = "rescheduled" if reschedule_of else "booked"
+    return True, (
+        f"You're all set! I've {verb} your {service_name} for {start.strftime('%A, %B %d')} at "
         f"{_format_time(start)}. We look forward to seeing you!"
     )
