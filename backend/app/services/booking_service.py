@@ -163,6 +163,31 @@ _TODAY_RE = re.compile(r"\btoday\b", re.IGNORECASE)
 _TOMORROW_RE = re.compile(r"\btomorrow\b", re.IGNORECASE)
 
 
+_AM_RE = re.compile(r"\b(a\.?m\.?|morning)\b", re.IGNORECASE)
+_PM_RE = re.compile(r"\b(p\.?m\.?|afternoon|evening|tonight)\b", re.IGNORECASE)
+
+
+def _reconcile_meridiem(text: str, time_str: str | None) -> str | None:
+    """When the caller states a half-day ("AM", "no, morning") the fast LLM
+    sometimes keeps the opposite one it heard a moment earlier ("ten thirty PM"
+    then "AM" stayed 22:30). If THIS message clearly says one half-day and the
+    extracted time is in the other, flip it to match what they just said. 12:xx
+    and 00:xx are left alone to avoid noon/midnight ambiguity."""
+    if not time_str:
+        return time_str
+    try:
+        h, m = (int(x) for x in time_str.split(":"))
+    except (ValueError, AttributeError):
+        return time_str
+    said_am = bool(_AM_RE.search(text or "")) and not _PM_RE.search(text or "")
+    said_pm = bool(_PM_RE.search(text or "")) and not _AM_RE.search(text or "")
+    if said_am and 13 <= h <= 23:
+        h -= 12
+    elif said_pm and 1 <= h <= 11:
+        h += 12
+    return f"{h:02d}:{m:02d}"
+
+
 def _resolve_explicit_day(text: str, today: date) -> date | None:
     """Resolve a day the customer named plainly ("monday", "next fri", "today",
     "tomorrow") to a real date, in the org's timezone. Returns None when the
@@ -408,14 +433,46 @@ def _parse_slot_datetime(date_str: str, time_str: str, org_timezone) -> datetime
     return naive.replace(tzinfo=org_timezone)
 
 
+def _extraction_user_content(recent_messages: list[dict] | None, latest: str) -> str:
+    """Fold a few recent turns into the extraction call as plain context so the
+    model can complete a split/paused utterance (voice callers say "Monday at ten
+    thirty" then "AM" as separate turns). Folded as text in ONE user message —
+    not as separate role turns — to avoid provider role-alternation constraints.
+    The trailing duplicate of `latest` (webchat history already includes it) is
+    dropped, and when there's no usable context we return `latest` unchanged so
+    behaviour is identical to before."""
+    ctx: list[str] = []
+    for m in (recent_messages or [])[-6:]:
+        content = (m.get("content") or "").strip()
+        if not content or content == latest.strip():
+            continue
+        role = (m.get("role") or "").lower()
+        who = "Assistant" if role in ("ai", "assistant", "agent") else "Customer"
+        ctx.append(f"{who}: {content}")
+    if not ctx:
+        return latest
+    return (
+        "Recent conversation (for context only):\n"
+        + "\n".join(ctx)
+        + "\n\nLatest customer message to extract from:\n"
+        + latest
+    )
+
+
 async def _extract_booking_fields(
-    db: AsyncSession, org_id: uuid.UUID, message_text: str, service_names: list[str], org_timezone_name: str, org_tz
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    message_text: str,
+    service_names: list[str],
+    org_timezone_name: str,
+    org_tz,
+    recent_messages: list[dict] | None = None,
 ) -> dict:
     try:
         clients = await get_org_llm_clients(db, org_id, model_tier="fast")
         raw = await call_llm_with_fallback(
             clients,
-            messages=[{"role": "user", "content": message_text}],
+            messages=[{"role": "user", "content": _extraction_user_content(recent_messages, message_text)}],
             system_prompt=get_booking_extraction_prompt(
                 service_names=service_names,
                 today=datetime.now(org_tz).date().isoformat(),
@@ -428,12 +485,14 @@ async def _extract_booking_fields(
         return {}
 
 
-async def _extract_contact_info(db: AsyncSession, org_id: uuid.UUID, message_text: str) -> dict:
+async def _extract_contact_info(
+    db: AsyncSession, org_id: uuid.UUID, message_text: str, recent_messages: list[dict] | None = None
+) -> dict:
     try:
         clients = await get_org_llm_clients(db, org_id, model_tier="fast")
         raw = await call_llm_with_fallback(
             clients,
-            messages=[{"role": "user", "content": message_text}],
+            messages=[{"role": "user", "content": _extraction_user_content(recent_messages, message_text)}],
             system_prompt=get_contact_info_extraction_prompt(),
         )
         return parse_json_response(raw)
@@ -574,11 +633,16 @@ async def process_booking_intent(
     user_input: str,
     intent: str = "booking_request",
     channel: str = "text",
+    history: list[dict] | None = None,
 ) -> str:
     """Loads/creates the conversation's booking FSM, advances it with
     `user_input`, and returns the text to send back. On reaching BOOKED,
     actually performs the booking: hold slot -> create Calendar event ->
     save appointment -> release hold -> confirmation text.
+
+    `history` is the recent conversation (most recent last) — passed to the
+    date/time and name/email extractors so a split or paused voice utterance
+    ("Monday at ten thirty" … then "AM") is understood as one request.
     """
     org = await db.get(Organization, org_id)
     services = (org.booking_config or {}).get("services", []) if org else []
@@ -654,7 +718,7 @@ async def process_booking_intent(
     # gave ("book a cleaning tomorrow at 2pm") must not be thrown away and re-asked.
     if previous_state in (BookingState.IDLE, BookingState.COLLECTING_SERVICE, BookingState.COLLECTING_TIME):
         extracted = await _extract_booking_fields(
-            db, org_id, user_input, list(service_by_name.keys()), org_timezone_name, org_tz
+            db, org_id, user_input, list(service_by_name.keys()), org_timezone_name, org_tz, history
         )
         if extracted.get("service") in service_by_name:
             fsm.collected_data["service"] = extracted["service"]
@@ -681,6 +745,10 @@ async def process_booking_intent(
             if picked is not None:
                 fsm.collected_data["date"] = picked.date().isoformat()
                 fsm.collected_data["time"] = picked.strftime("%H:%M")
+
+        # Apply a half-day correction ("no, AM") the LLM may have missed.
+        if fsm.collected_data.get("time"):
+            fsm.collected_data["time"] = _reconcile_meridiem(user_input, fsm.collected_data["time"])
 
         # If the requested day is one the practice is CLOSED (e.g. a weekend),
         # say so immediately and ask for another day — don't accept the day and
@@ -740,7 +808,7 @@ async def process_booking_intent(
                 fsm.current_state = BookingState.COLLECTING_SERVICE
 
     elif previous_state == BookingState.COLLECTING_CONTACT_INFO:
-        extracted = await _extract_contact_info(db, org_id, user_input)
+        extracted = await _extract_contact_info(db, org_id, user_input, history)
         name = (extracted.get("name") or "").strip() or None
         email = (extracted.get("email") or "").strip() or None
         valid_email = email if _is_valid_email(email) else None
@@ -787,7 +855,7 @@ async def process_booking_intent(
             and not _looks_like_contact_correction(text)
         )
         if not pure_yes:
-            extracted = await _extract_contact_info(db, org_id, user_input)
+            extracted = await _extract_contact_info(db, org_id, user_input, history)
             name = (extracted.get("name") or "").strip() or None
             email = (extracted.get("email") or "").strip() or None
             valid_email = email if _is_valid_email(email) else None

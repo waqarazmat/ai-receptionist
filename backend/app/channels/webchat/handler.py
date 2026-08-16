@@ -240,7 +240,7 @@ async def _process_send_message(sid: str, message_text: str) -> None:
         if route_to_booking:
             # e. Booking — hands off to the FSM-driven booking flow instead of RAG.
             response_text = await process_booking_intent(
-                db, org_id, conversation_id, conversation.contact_id, message_text, intent
+                db, org_id, conversation_id, conversation.contact_id, message_text, intent, history=history
             )
             await add_message(db, conversation_id, MessageRole.ai, response_text, Channel.webchat)
             await _send_complete_reply(sid, response_text)

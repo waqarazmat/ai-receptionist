@@ -1440,12 +1440,20 @@ async def _handle_turn(
     # email is used for the appointment reminder emails.
     booking_active = await booking_session_active(conversation_id)
     if booking_active or _is_booking_trigger(message_text):
+        # Pass the recent transcript so the extractor can stitch a split/paused
+        # utterance ("Monday at ten thirty" … then "AM") into one request instead
+        # of only seeing the last fragment.
+        recent_context = [
+            {"role": t.get("role"), "content": t.get("content")}
+            for t in transcript[-6:]
+            if (t.get("content") or "").strip()
+        ]
         async with async_session_maker() as db:
             conv = await db.get(Conversation, conversation_id)
             contact_id = conv.contact_id if conv else None
             reply = (
                 await process_booking_intent(
-                    db, org_id, conversation_id, contact_id, message_text, channel="voice"
+                    db, org_id, conversation_id, contact_id, message_text, channel="voice", history=recent_context
                 )
                 if contact_id is not None
                 else FALLBACK_MESSAGE
